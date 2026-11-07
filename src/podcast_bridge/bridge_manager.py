@@ -14,11 +14,14 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Set
 
+from zeroconf import IPVersion, InterfaceChoice, ServiceInfo
+from zeroconf.asyncio import AsyncZeroconf
+
 from .airplay_manager import AirPlayManager, make_cast_uuid
 from .audio_relay import AudioRelayManager, has_ffmpeg
 from .cast_auth import CastAuthManager
 from .cast_client import send_test_cast_session
-from .cast_receiver import VirtualChromecastAudio
+from .cast_receiver import SharedRawMdnsAdvertiser, VirtualChromecastAudio
 from .ha_client import HomeAssistantClient
 from .models import (
     BridgeSettings,
@@ -93,6 +96,11 @@ class BridgeManager:
         self.ha_client = HomeAssistantClient(self.settings.ha, on_event=self._record_event)
         self.airplay_manager = AirPlayManager(self.relay_manager, ha_client=self.ha_client, on_event=self._record_event)
 
+        # Centralized shared mDNS infrastructure (avoids SO_REUSEPORT kernel 4-tuple query collision)
+        self._shared_aiozc: Optional[AsyncZeroconf] = None
+        self._shared_raw_mdns: Optional[SharedRawMdnsAdvertiser] = None
+        self._registered_service_infos: Dict[str, ServiceInfo] = {}
+
     def _record_event(
         self,
         device_id: str,
@@ -117,6 +125,12 @@ class BridgeManager:
 
     def _on_device_state_change(self, device: HomePodDevice) -> None:
         self._broadcast_ws({"type": "device_updated", "device": device.model_dump()})
+        if self.settings.mdns_enabled and self._shared_raw_mdns:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._shared_raw_mdns.announce_all())
+            except RuntimeError:
+                pass
 
     def _broadcast_ws(self, message: Dict[str, Any]) -> None:
         for q in list(self._ws_Queues):
@@ -248,8 +262,36 @@ class BridgeManager:
 
         return changed
 
+    async def _start_shared_mdns(self) -> None:
+        """Start shared mDNS advertiser and AsyncZeroconf instances for all bridged speakers."""
+        if not self.settings.mdns_enabled or self._shared_raw_mdns is not None:
+            return
+        adv_ip = self.settings.host_ip if self.settings.host_ip and self.settings.host_ip != "0.0.0.0" else "127.0.0.1"
+        try:
+            self._shared_raw_mdns = SharedRawMdnsAdvertiser(
+                ip_address=adv_ip,
+                receivers_provider=lambda: list(self.receivers.values()),
+            )
+            await self._shared_raw_mdns.start()
+        except Exception as exc:
+            logger.warning("Shared RawMdnsAdvertiser start notice: %s", exc)
+
+        try:
+            if adv_ip not in ("127.0.0.1", "0.0.0.0"):
+                self._shared_aiozc = AsyncZeroconf(ip_version=IPVersion.V4Only, interfaces=[adv_ip])
+            else:
+                self._shared_aiozc = AsyncZeroconf(ip_version=IPVersion.V4Only, interfaces=InterfaceChoice.All)
+        except Exception:
+            try:
+                self._shared_aiozc = AsyncZeroconf(ip_version=IPVersion.V4Only)
+            except Exception as exc:
+                logger.warning("Shared AsyncZeroconf start notice: %s", exc)
+
     async def start(self, seed_default_if_empty: bool = True) -> None:
         """Start the bridge manager, discover HomePods, and launch virtual Chromecast Audio servers."""
+        if self.settings.mdns_enabled:
+            await self._start_shared_mdns()
+
         ha_players = await self.ha_client.discover_media_players()
 
         should_scan = (
@@ -371,9 +413,22 @@ class BridgeManager:
         self.save_state()
 
     async def stop(self) -> None:
-        """Stop all virtual Chromecast Audio receivers and AirPlay streams."""
+        """Stop all virtual Chromecast Audio receivers, shared mDNS advertisers, and AirPlay streams."""
         for dev_id in list(self.receivers.keys()):
             await self.stop_receiver(dev_id)
+
+        if self._shared_raw_mdns:
+            await self._shared_raw_mdns.stop()
+            self._shared_raw_mdns = None
+
+        if self._shared_aiozc:
+            try:
+                await self._shared_aiozc.async_close()
+            except Exception:
+                pass
+            self._shared_aiozc = None
+            self._registered_service_infos.clear()
+
         await self.airplay_manager.close_all()
 
     async def register_device(
@@ -476,6 +531,9 @@ class BridgeManager:
         if not dev or device_id in self.receivers:
             return
 
+        if self.settings.mdns_enabled and self._shared_raw_mdns is None:
+            await self._start_shared_mdns()
+
         receiver = VirtualChromecastAudio(
             device=dev,
             host_ip=self.settings.host_ip,
@@ -488,16 +546,40 @@ class BridgeManager:
             on_volume=self._handle_cast_volume,
             on_event=self._record_event,
             on_state_change=self._on_device_state_change,
-            mdns_enabled=self.settings.mdns_enabled,
+            mdns_enabled=False,
         )
         await receiver.start()
         self.receivers[device_id] = receiver
+
+        if self.settings.mdns_enabled:
+            if self._shared_aiozc:
+                try:
+                    s_info = receiver.build_service_info()
+                    self._registered_service_infos[device_id] = s_info
+                    await self._shared_aiozc.async_register_service(s_info, allow_name_change=True)
+                except Exception as exc:
+                    logger.warning("Shared Zeroconf registration notice for %s: %s", dev.cast_name, exc)
+            if self._shared_raw_mdns:
+                await self._shared_raw_mdns.announce_all()
+
         self._on_device_state_change(dev)
 
     async def stop_receiver(self, device_id: str) -> None:
         receiver = self.receivers.pop(device_id, None)
-        if receiver:
-            await receiver.stop()
+        if not receiver:
+            return
+
+        if self.settings.mdns_enabled:
+            if self._shared_aiozc and device_id in self._registered_service_infos:
+                s_info = self._registered_service_infos.pop(device_id)
+                try:
+                    await self._shared_aiozc.async_unregister_service(s_info)
+                except Exception as exc:
+                    logger.debug("Shared Zeroconf unregister notice for %s: %s", device_id, exc)
+            if self._shared_raw_mdns:
+                await self._shared_raw_mdns.announce_goodbye(receiver)
+
+        await receiver.stop()
 
     async def restart_all_receivers(self) -> None:
         """Restart all enabled Chromecast Audio receivers (e.g. after TLS cert bundle or IP change)."""
@@ -703,7 +785,7 @@ class BridgeManager:
 
     def get_status_summary(self) -> Dict[str, Any]:
         return {
-            "version": "0.4.5",
+            "version": "0.4.6",
             "host_ip": self.settings.host_ip,
             "web_port": self.web_port,
             "ffmpeg_available": has_ffmpeg(),

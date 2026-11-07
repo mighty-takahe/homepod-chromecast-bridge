@@ -505,3 +505,56 @@ async def test_kitchen_retention_and_ha_dual_discovery(tmp_path: Path):
     assert kitchen_dev.ha_entity_id == "media_player.kitchen_homepod_mini"
 
     await mgr.stop()
+
+
+@pytest.mark.asyncio
+async def test_unified_multi_device_mdns(tmp_path: Path):
+    """Verify multi-device RFC 6762 mDNS response packet encoding and shared advertiser behavior."""
+    import zeroconf
+    from podcast_bridge.bridge_manager import BridgeManager
+    from podcast_bridge.cast_receiver import (
+        build_multi_mdns_packet,
+        build_receiver_goodbye_packet,
+    )
+
+    mgr = BridgeManager(data_dir=tmp_path, web_port=18791, mdns_enabled=False)
+    await mgr.start(seed_default_if_empty=True)
+
+    # BridgeManager seeded 2 devices (Living Room on 8009 and Kitchen on 8010)
+    assert len(mgr.receivers) >= 2
+    receivers_list = list(mgr.receivers.values())
+
+    # 1. Build multi-device mDNS packet
+    packet = build_multi_mdns_packet(receivers_list, ip_address="192.168.1.50", ttl=120)
+    assert len(packet) > 100
+
+    incoming = zeroconf.DNSIncoming(packet)
+    assert incoming.valid is True
+    assert incoming.num_answers == len(receivers_list)
+    assert incoming.num_additionals >= 2 * len(receivers_list)
+
+    all_recs = incoming.answers()
+    # Check PTR records for each device
+    ptr_records = [a for a in all_recs if a.type == 12]
+    assert len(ptr_records) == len(receivers_list)
+    ptr_aliases = [p.alias for p in ptr_records]
+
+    for r in receivers_list:
+        expected_label = f"Chromecast-Audio-{r.clean_id}._googlecast._tcp.local."
+        assert expected_label in ptr_aliases
+
+    # Check SRV records have distinct ports (8009 and 8010)
+    srv_records = [a for a in all_recs if a.type == 33]
+    srv_ports = {s.port for s in srv_records}
+    assert 8009 in srv_ports
+    assert 8010 in srv_ports
+
+    # 2. Verify goodbye packet has ttl=0
+    goodbye_pkt = build_receiver_goodbye_packet(receivers_list[0], ip_address="192.168.1.50")
+    gb_incoming = zeroconf.DNSIncoming(goodbye_pkt)
+    assert gb_incoming.valid is True
+    assert gb_incoming.num_answers == 1
+    assert gb_incoming.answers()[0].ttl == 0
+
+    await mgr.stop()
+

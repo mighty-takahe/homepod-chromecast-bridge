@@ -114,21 +114,231 @@ def build_mdns_announcement_packet(
     txt: Dict[str, str],
     ttl: int = 120,
 ) -> bytes:
-    """Build a complete RFC 6762 mDNS response packet with PTR, SRV, TXT, and A records."""
+    """Build a complete RFC 6762 mDNS response packet with PTR in Answer, and SRV/TXT/A in Additional."""
     service_fqdn = f"{GOOGLECAST_SERVICE}."
     instance_fqdn = f"{instance_label}.{GOOGLECAST_SERVICE}."
     host_fqdn = server_fqdn if server_fqdn.endswith(".") else f"{server_fqdn}."
 
-    # PTR is a shared record (class 0x0001 IN, no cache-flush bit so multiple speakers coexist)
+    # PTR is a shared record in Answer section (class 0x0001 IN, no cache-flush bit)
     ptr_rec = _encode_dns_record(service_fqdn, 12, 0x0001, 4500 if ttl > 0 else 0, _encode_dns_name(instance_fqdn))
-    # SRV, TXT, and A are unique records per speaker instance
+    # SRV, TXT, and A are unique records in Additional section (class 0x8001 IN with cache-flush)
     srv_rdata = struct.pack(">HHH", 0, 0, port) + _encode_dns_name(host_fqdn)
     srv_rec = _encode_dns_record(instance_fqdn, 33, 0x8001, ttl, srv_rdata)
     txt_rec = _encode_dns_record(instance_fqdn, 16, 0x8001, 4500 if ttl > 0 else 0, _encode_txt_rdata(txt))
     a_rec = _encode_dns_record(host_fqdn, 1, 0x8001, ttl, ipaddress.IPv4Address(ip_address).packed)
 
-    header = struct.pack(">HHHHHH", 0, 0x8400, 0, 4, 0, 0)
+    header = struct.pack(">HHHHHH", 0, 0x8400, 0, 1, 0, 3)
     return header + ptr_rec + srv_rec + txt_rec + a_rec
+
+
+def build_multi_mdns_packet(
+    receivers: List[VirtualChromecastAudio],
+    ip_address: str,
+    ttl: int = 120,
+) -> bytes:
+    """Build a complete RFC 6762 mDNS response packet containing all active Cast receivers.
+
+    Answers (ANCOUNT): PTR records for each receiver (_googlecast._tcp.local. -> instance_fqdn).
+    Additionals (ARCOUNT): SRV, TXT, and A records for each receiver.
+    """
+    if not receivers:
+        return struct.pack(">HHHHHH", 0, 0x8400, 0, 0, 0, 0)
+
+    service_fqdn = f"{GOOGLECAST_SERVICE}."
+    answers = bytearray()
+    additionals = bytearray()
+    seen_hosts: Set[str] = set()
+
+    for r in receivers:
+        instance_label = f"Chromecast-Audio-{r.clean_id}"
+        instance_fqdn = f"{instance_label}.{GOOGLECAST_SERVICE}."
+        host_fqdn = f"{r.hyphenated_uuid}.local."
+        txt = r.build_txt_dict() if hasattr(r, "build_txt_dict") else r._build_txt_dict()
+        port = r.device.cast_port
+
+        # PTR in Answer section (class 0x0001 IN, shared record without cache-flush bit)
+        answers.extend(
+            _encode_dns_record(
+                service_fqdn, 12, 0x0001, 4500 if ttl > 0 else 0, _encode_dns_name(instance_fqdn)
+            )
+        )
+
+        # SRV in Additional section (class 0x8001 IN with cache-flush bit)
+        srv_rdata = struct.pack(">HHH", 0, 0, port) + _encode_dns_name(host_fqdn)
+        additionals.extend(
+            _encode_dns_record(instance_fqdn, 33, 0x8001, ttl, srv_rdata)
+        )
+
+        # TXT in Additional section (class 0x8001 IN with cache-flush bit)
+        additionals.extend(
+            _encode_dns_record(instance_fqdn, 16, 0x8001, 4500 if ttl > 0 else 0, _encode_txt_rdata(txt))
+        )
+
+        # A in Additional section (class 0x8001 IN with cache-flush bit)
+        adv_ip = r.host_ip if (r.host_ip and r.host_ip not in ("0.0.0.0", "")) else ip_address
+        if adv_ip and adv_ip not in ("0.0.0.0", "") and host_fqdn not in seen_hosts:
+            seen_hosts.add(host_fqdn)
+            additionals.extend(
+                _encode_dns_record(host_fqdn, 1, 0x8001, ttl, ipaddress.IPv4Address(adv_ip).packed)
+            )
+
+    num_answers = len(receivers)
+    num_additionals = 2 * len(receivers) + len(seen_hosts)
+    header = struct.pack(">HHHHHH", 0, 0x8400, 0, num_answers, 0, num_additionals)
+    return bytes(header + answers + additionals)
+
+
+def build_receiver_goodbye_packet(receiver: VirtualChromecastAudio, ip_address: str) -> bytes:
+    """Build an RFC 6762 goodbye packet (TTL=0) for a stopping Cast receiver."""
+    return build_multi_mdns_packet([receiver], ip_address, ttl=0)
+
+
+class SharedRawMdnsAdvertiser:
+    """Direct UDP multicast mDNS responder on 224.0.0.251:5353 bound to the LAN interface.
+
+    Serves unified multi-device RFC 6762 responses for all bridged Chromecast Audio devices,
+    preventing Linux SO_REUSEPORT kernel 4-tuple query starvation across multiple speakers.
+    """
+
+    def __init__(
+        self,
+        ip_address: str,
+        receivers_provider: Callable[[], List[VirtualChromecastAudio]],
+        interval: float = 20.0,
+    ) -> None:
+        self.ip_address = ip_address
+        self.receivers_provider = receivers_provider
+        self.interval = interval
+        self._sock: Optional[socket.socket] = None
+        self._task: Optional[asyncio.Task[None]] = None
+
+    async def start(self) -> None:
+        if not self.ip_address or self.ip_address in ("0.0.0.0",):
+            return
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError:
+                    pass
+            sock.bind(("", MDNS_PORT))
+            if self.ip_address != "127.0.0.1":
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.ip_address))
+                except OSError:
+                    pass
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+            mreq = socket.inet_aton(MDNS_MULTICAST_ADDR) + (
+                socket.inet_aton(self.ip_address) if self.ip_address != "127.0.0.1" else socket.inet_aton("0.0.0.0")
+            )
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            except OSError:
+                sock.setsockopt(
+                    socket.IPPROTO_IP,
+                    socket.IP_ADD_MEMBERSHIP,
+                    socket.inet_aton(MDNS_MULTICAST_ADDR) + socket.inet_aton("0.0.0.0"),
+                )
+            sock.setblocking(False)
+            self._sock = sock
+            self._task = asyncio.create_task(self._run_loop())
+            logger.info("SharedRawMdnsAdvertiser started on %s:5353", self.ip_address)
+        except Exception as exc:
+            logger.debug("SharedRawMdnsAdvertiser bind notice (%s): %s", self.ip_address, exc)
+
+    async def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        if self._sock:
+            try:
+                receivers = [r for r in self.receivers_provider() if getattr(r.device, "enabled", True)]
+                if receivers:
+                    goodbye = build_multi_mdns_packet(receivers, self.ip_address, ttl=0)
+                    self._sock.sendto(goodbye, (MDNS_MULTICAST_ADDR, MDNS_PORT))
+            except Exception:
+                pass
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+    async def announce_all(self) -> None:
+        """Broadcast all active devices to 224.0.0.251:5353."""
+        if not self._sock:
+            return
+        receivers = [r for r in self.receivers_provider() if getattr(r.device, "enabled", True)]
+        if not receivers:
+            return
+        pkt = build_multi_mdns_packet(receivers, self.ip_address)
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.sock_sendto(self._sock, pkt, (MDNS_MULTICAST_ADDR, MDNS_PORT))
+        except Exception as exc:
+            logger.debug("SharedRawMdnsAdvertiser announce_all notice: %s", exc)
+
+    async def announce_goodbye(self, receiver: VirtualChromecastAudio) -> None:
+        """Broadcast a goodbye packet (TTL=0) for a stopping receiver."""
+        if not self._sock:
+            return
+        pkt = build_receiver_goodbye_packet(receiver, self.ip_address)
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.sock_sendto(self._sock, pkt, (MDNS_MULTICAST_ADDR, MDNS_PORT))
+        except Exception as exc:
+            logger.debug("SharedRawMdnsAdvertiser announce_goodbye notice: %s", exc)
+
+    async def _run_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        assert self._sock is not None
+        service_wire = _encode_dns_name(GOOGLECAST_SERVICE)[:-1]
+
+        # Initial burst: 2 announcements 1s apart per RFC 6762
+        for _ in range(2):
+            await asyncio.sleep(1.0)
+            await self.announce_all()
+
+        while True:
+            try:
+                data, addr = await asyncio.wait_for(loop.sock_recvfrom(self._sock, 9000), timeout=self.interval)
+                if len(data) >= 12:
+                    flags = struct.unpack(">H", data[2:4])[0]
+                    is_query = (flags & 0x8000) == 0
+                    if is_query:
+                        receivers = [r for r in self.receivers_provider() if getattr(r.device, "enabled", True)]
+                        if not receivers:
+                            continue
+                        matches = service_wire in data
+                        if not matches:
+                            for r in receivers:
+                                inst_wire = _encode_dns_name(f"Chromecast-Audio-{r.clean_id}")[:-1]
+                                if inst_wire in data:
+                                    matches = True
+                                    break
+                        if matches:
+                            pkt = build_multi_mdns_packet(receivers, self.ip_address)
+                            # Multicast to 224.0.0.251:5353
+                            await loop.sock_sendto(self._sock, pkt, (MDNS_MULTICAST_ADDR, MDNS_PORT))
+                            # Direct unicast reply to querier
+                            if addr and addr[0] not in ("0.0.0.0", "127.0.0.1"):
+                                try:
+                                    await loop.sock_sendto(self._sock, pkt, addr)
+                                except Exception:
+                                    pass
+            except asyncio.TimeoutError:
+                await self.announce_all()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await asyncio.sleep(2.0)
 
 
 class RawMdnsAdvertiser:
@@ -322,7 +532,7 @@ class VirtualChromecastAudio:
         self._https_8443_server: Optional[asyncio.AbstractServer] = None
         self._aiozc: Optional[AsyncZeroconf] = None
         self._service_info: Optional[ServiceInfo] = None
-        self._raw_mdns: Optional[RawMdnsAdvertiser] = None
+        self._raw_mdns: Optional[Any] = None
         self._clients: Set[asyncio.StreamWriter] = set()
 
     def _emit(self, direction: str, namespace: str, summary: str, payload_preview: str = "") -> None:
@@ -341,7 +551,7 @@ class VirtualChromecastAudio:
         if self._on_state_change:
             self._on_state_change(self.device)
 
-    def _build_txt_dict(self) -> Dict[str, str]:
+    def build_txt_dict(self) -> Dict[str, str]:
         """Build the exact 12-key `_googlecast._tcp.local.` TXT record matching vibecast / Chromecast Audio."""
         cd_id = self.auth_manager.get_active_peer_cert_md5_hex()
         bs_id = hashlib.md5(self.hyphenated_uuid.encode("utf-8")).digest()[:6].hex().upper()
@@ -360,6 +570,25 @@ class VirtualChromecastAudio:
             "rs": "" if is_idle else (self.device.media.title or self.app_name),
             "rm": "",
         }
+
+    def _build_txt_dict(self) -> Dict[str, str]:
+        return self.build_txt_dict()
+
+    def build_service_info(self) -> ServiceInfo:
+        """Build zeroconf ServiceInfo for this virtual Chromecast Audio device."""
+        instance_label = f"Chromecast-Audio-{self.clean_id}"
+        server_fqdn = f"{self.hyphenated_uuid}.local."
+        adv_ip = self.host_ip if self.host_ip and self.host_ip != "0.0.0.0" else "127.0.0.1"
+        svc_name = f"{instance_label}._googlecast._tcp.local."
+        ip_bytes = socket.inet_aton(adv_ip)
+        return ServiceInfo(
+            type_="_googlecast._tcp.local.",
+            name=svc_name,
+            addresses=[ip_bytes],
+            port=self.device.cast_port,
+            properties=self.build_txt_dict(),
+            server=server_fqdn,
+        )
 
     async def start(self) -> None:
         """Start the CastV2 TLS server, Eureka/DIAL HTTP+HTTPS servers, and mDNS service."""
@@ -471,34 +700,19 @@ class VirtualChromecastAudio:
                 setattr(self, srv_attr, None)
 
     async def _register_mdns(self) -> None:
-        """Advertise `_googlecast._tcp.local.` via both Zeroconf and RawMdnsAdvertiser."""
-        instance_label = f"Chromecast-Audio-{self.clean_id}"
-        server_fqdn = f"{self.hyphenated_uuid}.local."
+        """Advertise `_googlecast._tcp.local.` when running standalone without BridgeManager."""
         adv_ip = self.host_ip if self.host_ip and self.host_ip != "0.0.0.0" else "127.0.0.1"
-        properties = self._build_txt_dict()
 
         # 1. Start direct multicast responder on the LAN interface
-        self._raw_mdns = RawMdnsAdvertiser(
-            instance_label=instance_label,
-            server_fqdn=server_fqdn,
+        self._raw_mdns = SharedRawMdnsAdvertiser(
             ip_address=adv_ip,
-            port=self.device.cast_port,
-            txt_provider=self._build_txt_dict,
+            receivers_provider=lambda: [self],
         )
         await self._raw_mdns.start()
 
         # 2. Register via AsyncZeroconf bound to the LAN interface IP
         try:
-            svc_name = f"{instance_label}._googlecast._tcp.local."
-            ip_bytes = socket.inet_aton(adv_ip)
-            self._service_info = ServiceInfo(
-                type_="_googlecast._tcp.local.",
-                name=svc_name,
-                addresses=[ip_bytes],
-                port=self.device.cast_port,
-                properties=properties,
-                server=server_fqdn,
-            )
+            self._service_info = self.build_service_info()
             try:
                 if adv_ip not in ("127.0.0.1", "0.0.0.0"):
                     self._aiozc = AsyncZeroconf(ip_version=IPVersion.V4Only, interfaces=[adv_ip])
@@ -508,6 +722,7 @@ class VirtualChromecastAudio:
                 self._aiozc = AsyncZeroconf(ip_version=IPVersion.V4Only)
             await self._aiozc.async_register_service(self._service_info, allow_name_change=True)
         except Exception as exc:
+            logger.warning("Zeroconf mDNS registration notice for %s: %s", self.device.cast_name, exc)
             logger.warning("Zeroconf mDNS registration notice for %s: %s", self.device.cast_name, exc)
 
     def _build_receiver_status(self, request_id: int = 0) -> Dict[str, Any]:
