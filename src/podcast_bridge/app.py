@@ -93,7 +93,7 @@ def create_app(
 
     app = FastAPI(
         title="PodCast Bridge — HomePod Mini to Chromecast Audio",
-        version="0.2.0",
+        version="0.4.0",
         lifespan=lifespan,
     )
     app.state.bridge = manager
@@ -277,10 +277,17 @@ def create_app(
 
     # --- Audio Stream Relay Endpoints ---
 
-    @app.get("/api/relay/test-chime.wav")
-    async def serve_test_chime() -> Response:
+    @app.api_route("/api/relay/test-chime.wav", methods=["GET", "HEAD"])
+    async def serve_test_chime(request: Request) -> Response:
         wav_bytes = manager.relay_manager.get_test_chime_bytes()
-        return Response(content=wav_bytes, media_type="audio/wav")
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(len(wav_bytes)),
+            "Content-Type": "audio/wav",
+        }
+        if request.method == "HEAD":
+            return Response(content=b"", headers=headers, media_type="audio/wav")
+        return Response(content=wav_bytes, headers=headers, media_type="audio/wav")
 
     @app.get("/api/relay/{device_id}/stream.{ext}")
     async def serve_device_relay_stream(device_id: str, ext: str) -> StreamingResponse:

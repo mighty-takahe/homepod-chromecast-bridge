@@ -30,9 +30,11 @@ class AirPlayManager:
     def __init__(
         self,
         relay_manager: AudioRelayManager,
+        ha_client: Optional[Any] = None,
         on_event: Optional[Callable[[str, str, str, str, str], None]] = None,
     ) -> None:
         self.relay = relay_manager
+        self.ha_client = ha_client
         self._on_event = on_event
         self._active_connections: Dict[str, Any] = {}
         self._pairing_handlers: Dict[str, Any] = {}
@@ -142,24 +144,57 @@ class AirPlayManager:
         finally:
             await pairing.close()
 
-    async def _connect_pyatv(self, device: HomePodDevice) -> Any:
-        """Connect to a physical HomePod Mini via pyatv."""
-        if device.id in self._active_connections:
-            return self._active_connections[device.id]
+    async def _connect_pyatv(
+        self,
+        device: HomePodDevice,
+        protocol_version: Any = None,
+    ) -> Any:
+        """Connect to a physical HomePod Mini via pyatv with MRP tunnel disabled and unicast mDNS fallback."""
+        from ipaddress import IPv4Address
+        from pyatv.conf import AppleTV
+        from pyatv.core import MutableService
+        from pyatv.settings import AirPlayVersion, MrpTunnel
+        from pyatv.storage.memory_storage import MemoryStorage
 
         loop = asyncio.get_running_loop()
-        atvs = await pyatv.scan(loop, hosts=[device.ip_address], timeout=4)
-        if not atvs:
-            raise RuntimeError(f"HomePod '{device.name}' ({device.ip_address}) not reachable via mDNS/AirPlay")
+        conf: Optional[Any] = None
+        try:
+            atvs = await pyatv.scan(loop, hosts=[device.ip_address], timeout=3)
+            if atvs:
+                conf = atvs[0]
+        except Exception as exc:
+            logger.debug("pyatv scan for %s (%s) notice: %s", device.name, device.ip_address, exc)
 
-        conf = atvs[0]
+        if not conf:
+            # Fallback to direct AppleTV config when unicast mDNS is blocked by router
+            try:
+                ip_obj = IPv4Address(device.ip_address)
+            except Exception:
+                raise RuntimeError(f"Invalid HomePod IPv4 address: {device.ip_address}")
+            conf = AppleTV(ip_obj, device.name)
+            props = {
+                "am": device.model or "AudioAccessory5,1",
+                "model": device.model or "AudioAccessory5,1",
+                "ch": "2",
+                "ss": "16",
+                "sr": "44100",
+                "tp": "UDP",
+            }
+            conf.add_service(MutableService(device.mac_address or "AA:BB:CC:DD:EE:FF", Protocol.RAOP, device.airplay_port, props))
+            conf.add_service(MutableService(device.mac_address or "AA:BB:CC:DD:EE:FF", Protocol.AirPlay, device.airplay_port, props))
+
         if device.airplay_credentials:
             for proto in (Protocol.AirPlay, Protocol.RAOP, Protocol.Companion):
                 if conf.get_service(proto):
                     conf.set_credentials(proto, device.airplay_credentials)
 
-        atv = await pyatv.connect(conf, loop)
-        self._active_connections[device.id] = atv
+        storage = MemoryStorage()
+        settings = await storage.get_settings(conf)
+        # CRITICAL: Disable MRP tunnel to prevent remote control handshake failures on HomePods
+        settings.protocols.airplay.mrp_tunnel = MrpTunnel.Disable
+        settings.protocols.raop.protocol_version = protocol_version or AirPlayVersion.Auto
+
+        atv = await pyatv.connect(conf, loop, storage=storage)
         return atv
 
     async def play_stream(
@@ -170,6 +205,8 @@ class AirPlayManager:
         start_time: float = 0.0,
     ) -> None:
         """Start streaming audio to the HomePod Mini via the configured AirPlay transport."""
+        from pyatv.settings import AirPlayVersion
+
         await self.stop(device, emit_event=False)
         self.relay.register_source(device.id, source_url)
         device.player_state = PlayerState.PLAYING
@@ -177,7 +214,6 @@ class AirPlayManager:
         device.last_error = None
 
         async def _runner() -> None:
-
             if device.transport_mode == TransportMode.SIMULATED:
                 self._emit(
                     device.id,
@@ -187,13 +223,11 @@ class AirPlayManager:
                     f"Streaming audio to HomePod Mini ({device.ip_address}:{device.airplay_port}) [44.1kHz 16-bit PCM]",
                     f"source={source_url} relay={relay_url}",
                 )
-                # Consume first chunk from relay to verify pipeline integrity
                 bytes_streamed = 0
                 async for chunk in self.relay.stream_transcoded(device.id, source_url, start_time=start_time):
                     bytes_streamed += len(chunk)
                     if bytes_streamed >= 32768:
                         break
-                # Advance simulated playback clock while PLAYING
                 t0 = time.monotonic() - start_time
                 while device.player_state in (PlayerState.PLAYING, PlayerState.PAUSED):
                     if device.player_state == PlayerState.PLAYING:
@@ -207,47 +241,112 @@ class AirPlayManager:
                     await asyncio.sleep(0.5)
                 return
 
-            # Physical HomePod Mini via pyatv
-            try:
+            if device.transport_mode == TransportMode.HA_MEDIA_PLAYER and device.ha_entity_id and self.ha_client:
                 self._emit(
                     device.id,
                     device.name,
-                    "airplay_out",
-                    "pyatv.stream",
-                    f"Connecting to HomePod Mini at {device.ip_address}:{device.airplay_port} ({device.transport_mode.value})",
-                    f"url={source_url}",
+                    "ha_out",
+                    "media_player.play_media",
+                    f"Routing Cast audio via Home Assistant to {device.ha_entity_id}",
+                    f"url={relay_url}",
                 )
-                atv = await self._connect_pyatv(device)
-                if device.transport_mode == TransportMode.PYATV_URL:
-                    await atv.stream.play_url(relay_url, position=int(start_time))
-                else:
-                    # Stream transcoded WAV/MP3 via temporary file or stream buffer
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-                        async for chunk in self.relay.stream_transcoded(device.id, source_url, codec="wav", start_time=start_time):
-                            tmp.write(chunk)
-                        tmp.flush()
-                        await atv.stream.stream_file(tmp.name)
-                device.player_state = PlayerState.IDLE
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("pyatv stream to %s (%s) encountered error: %s", device.name, device.ip_address, exc)
-                device.last_error = str(exc)
-                self._emit(
-                    device.id,
-                    device.name,
-                    "airplay_out",
-                    "pyatv.error",
-                    f"AirPlay connection notice: {exc} (holding virtual session state)",
-                )
-                # Keep virtual playback timeline active so Cast sender sees responsive state
-                t0 = time.monotonic() - start_time
-                while device.player_state in (PlayerState.PLAYING, PlayerState.PAUSED):
-                    if device.player_state == PlayerState.PLAYING:
-                        device.media.current_time = round(time.monotonic() - t0, 2)
+                ok = await self.ha_client.play_media(device, relay_url)
+                if not ok:
+                    device.last_error = f"Home Assistant service call failed for {device.ha_entity_id}"
+                return
+
+            # Physical HomePod Mini streaming via pyatv (trying AirPlay 2 then AirPlay 1)
+            pyatv_err: Optional[Exception] = None
+            for p_ver in (AirPlayVersion.Auto, AirPlayVersion.V1):
+                atv = None
+                try:
+                    self._emit(
+                        device.id,
+                        device.name,
+                        "airplay_out",
+                        "pyatv.connect",
+                        f"Connecting to HomePod Mini ({device.ip_address}:{device.airplay_port}) [AirPlay {p_ver.value}]",
+                        f"url={source_url}",
+                    )
+                    atv = await self._connect_pyatv(device, protocol_version=p_ver)
+                    self._active_connections[device.id] = atv
+
+                    # Ensure volume is unmuted and audible (at least 35% on physical speaker)
+                    vol_pct = max(35.0, float((device.volume if not device.muted else 0.5) * 100.0))
+                    try:
+                        await atv.audio.set_volume(vol_pct)
+                    except Exception as v_err:
+                        logger.debug("Initial volume set notice: %s", v_err)
+
+                    if device.transport_mode == TransportMode.PYATV_URL:
+                        await atv.stream.play_url(relay_url, position=int(start_time))
                     else:
-                        t0 = time.monotonic() - device.media.current_time
-                    await asyncio.sleep(0.5)
+                        # Write audio chunks to temp WAV file and stream over RAOP
+                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+                            if source_url.endswith("/test-chime.wav") or source_url.startswith("builtin://"):
+                                tmp.write(self.relay.get_test_chime_bytes())
+                            else:
+                                async for chunk in self.relay.stream_transcoded(device.id, source_url, codec="wav", start_time=start_time):
+                                    tmp.write(chunk)
+                            tmp.flush()
+                            self._emit(
+                                device.id,
+                                device.name,
+                                "airplay_out",
+                                "raop.stream",
+                                f"Delivering PCM audio to HomePod Mini via AirPlay ({p_ver.value})",
+                            )
+                            await atv.stream.stream_file(tmp.name)
+
+                    device.player_state = PlayerState.IDLE
+                    device.last_error = None
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    pyatv_err = exc
+                    logger.warning("pyatv stream (%s) to %s (%s) error: %s", p_ver.value, device.name, device.ip_address, exc)
+                finally:
+                    if atv:
+                        try:
+                            atv.close()
+                        except Exception:
+                            pass
+                    self._active_connections.pop(device.id, None)
+
+            # If direct pyatv streaming encountered an error, fall back to Home Assistant media_player if linked
+            if device.ha_entity_id and self.ha_client and self.ha_client.config.connected:
+                self._emit(
+                    device.id,
+                    device.name,
+                    "ha_out",
+                    "media_player.fallback",
+                    f"Direct AirPlay hit permission notice; falling back to Home Assistant ({device.ha_entity_id})",
+                )
+                logger.info("pyatv direct streaming failed (%s); falling back to HA media_player -> %s", pyatv_err, device.ha_entity_id)
+                ok = await self.ha_client.play_media(device, relay_url)
+                if ok:
+                    device.last_error = None
+                    return
+
+            # Both direct AirPlay and HA fallback failed
+            err_msg = str(pyatv_err or "Unknown AirPlay streaming error")
+            device.last_error = err_msg
+            self._emit(
+                device.id,
+                device.name,
+                "airplay_out",
+                "pyatv.error",
+                f"AirPlay error: {err_msg} — Check Apple Home App 'Allow Speaker Access: Anyone on the Same Network'",
+            )
+            # Advance virtual timeline so Cast sender isn't abruptly severed
+            t0 = time.monotonic() - start_time
+            while device.player_state in (PlayerState.PLAYING, PlayerState.PAUSED):
+                if device.player_state == PlayerState.PLAYING:
+                    device.media.current_time = round(time.monotonic() - t0, 2)
+                else:
+                    t0 = time.monotonic() - device.media.current_time
+                await asyncio.sleep(0.5)
 
         task = asyncio.create_task(_runner())
         self._playback_tasks[device.id] = task

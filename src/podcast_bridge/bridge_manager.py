@@ -90,8 +90,8 @@ class BridgeManager:
 
         self.auth_manager = CastAuthManager(self.data_dir, self.settings.auth)
         self.relay_manager = AudioRelayManager(self.settings.audio)
-        self.airplay_manager = AirPlayManager(self.relay_manager, on_event=self._record_event)
         self.ha_client = HomeAssistantClient(self.settings.ha, on_event=self._record_event)
+        self.airplay_manager = AirPlayManager(self.relay_manager, ha_client=self.ha_client, on_event=self._record_event)
 
     def _record_event(
         self,
@@ -230,13 +230,21 @@ class BridgeManager:
 
     async def start(self, seed_default_if_empty: bool = True) -> None:
         """Start the bridge manager, discover HomePods, and launch virtual Chromecast Audio servers."""
-        await self.ha_client.check_connection()
+        ha_players = await self.ha_client.discover_media_players()
 
         if (not self.devices or not self._has_real_devices()) and seed_default_if_empty and self.settings.mdns_enabled:
             # Perform a network scan on startup so real HomePod Minis replace any seeded demo devices
             scanned = await self.airplay_manager.scan_network(timeout=3)
             for item in scanned:
                 if item.get("is_homepod", True):
+                    matched_ha = None
+                    dev_norm = "".join(c for c in item["name"].lower() if c.isalnum())
+                    for p in ha_players:
+                        p_norm = "".join(c for c in p["friendly_name"].lower() if c.isalnum())
+                        if p_norm and (p_norm in dev_norm or dev_norm in p_norm):
+                            matched_ha = p["entity_id"]
+                            break
+
                     await self.register_device(
                         name=item["name"],
                         ip_address=item["ip_address"],
@@ -244,8 +252,15 @@ class BridgeManager:
                         model=item["model"],
                         mac_address=item["mac_address"],
                         transport_mode=TransportMode.PYATV_STREAM,
+                        ha_entity_id=matched_ha,
                         start_immediately=False,
                     )
+
+        for dev in self.devices.values():
+            if not dev.ha_entity_id:
+                matched = self._match_ha_entity_for_device(dev, ha_players)
+                if matched:
+                    dev.ha_entity_id = matched
 
         await self._purge_seeded_simulated_if_real_present()
         self._sync_host_ip_from_real_devices()
@@ -487,6 +502,18 @@ class BridgeManager:
             await self.ha_client.set_volume(device, level, muted)
         self._on_device_state_change(device)
 
+    def _match_ha_entity_for_device(self, dev: HomePodDevice, ha_players: List[Dict[str, Any]]) -> Optional[str]:
+        dev_norm = "".join(c for c in dev.name.lower() if c.isalnum())
+        for p in ha_players:
+            p_norm = "".join(c for c in p["friendly_name"].lower() if c.isalnum())
+            if p_norm and (p_norm in dev_norm or dev_norm in p_norm):
+                return p["entity_id"]
+        for p in ha_players:
+            slug = p["entity_id"].replace("media_player.", "").replace("_", "")
+            if slug in dev_norm or dev_norm in slug:
+                return p["entity_id"]
+        return None
+
     async def test_cast_to_device(
         self,
         device_id: str,
@@ -513,6 +540,21 @@ class BridgeManager:
             artist="PodCast Bridge TLS Sender",
             album="HomePod Mini Chromecast Audio Bridge",
         )
+
+        # Wait up to 1.2s to observe physical streaming startup and capture any AirPlay delivery errors
+        await asyncio.sleep(1.2)
+        result["device_last_error"] = dev.last_error
+        result["player_state"] = dev.player_state.value
+        result["transport_mode"] = dev.transport_mode.value
+        result["ha_entity_id"] = dev.ha_entity_id
+
+        if dev.last_error:
+            result["playback_error"] = dev.last_error
+            result["troubleshooting"] = [
+                "1. Apple Home app -> Home Settings -> Speakers & TV -> set 'Allow Speaker & TV Access' to 'Anyone on the Same Network' (or 'Everyone') with 'Require Password' OFF.",
+                f"2. If your HomePod is integrated in Home Assistant, change Audio Delivery Transport to 'Home Assistant ({dev.ha_entity_id or 'media_player'})'.",
+                "3. Ensure Home Assistant Add-on has 'host_network: true' enabled.",
+            ]
         return result
 
     async def scan_all(self) -> Dict[str, Any]:
@@ -524,6 +566,14 @@ class BridgeManager:
         newly_added: List[str] = []
         for item in airplay_found:
             if item.get("is_homepod") or not has_explicit_homepod:
+                matched_ha = None
+                dev_norm = "".join(c for c in item["name"].lower() if c.isalnum())
+                for p in ha_players:
+                    p_norm = "".join(c for c in p["friendly_name"].lower() if c.isalnum())
+                    if p_norm and (p_norm in dev_norm or dev_norm in p_norm):
+                        matched_ha = p["entity_id"]
+                        break
+
                 dev = await self.register_device(
                     name=item["name"],
                     ip_address=item["ip_address"],
@@ -531,9 +581,18 @@ class BridgeManager:
                     model=item["model"],
                     mac_address=item["mac_address"],
                     transport_mode=TransportMode.PYATV_STREAM,
+                    ha_entity_id=matched_ha,
                     start_immediately=False,
                 )
                 newly_added.append(dev.id)
+
+        # Auto-match existing devices with Home Assistant media_players
+        for dev in self.devices.values():
+            if not dev.ha_entity_id:
+                matched = self._match_ha_entity_for_device(dev, ha_players)
+                if matched:
+                    dev.ha_entity_id = matched
+                    logger.info("Auto-linked HomePod '%s' (%s) to HA entity '%s'", dev.name, dev.ip_address, matched)
 
         purged = await self._purge_seeded_simulated_if_real_present()
         ip_changed = self._sync_host_ip_from_real_devices()
@@ -550,7 +609,7 @@ class BridgeManager:
 
     def get_status_summary(self) -> Dict[str, Any]:
         return {
-            "version": "0.3.1",
+            "version": "0.4.0",
             "host_ip": self.settings.host_ip,
             "web_port": self.web_port,
             "ffmpeg_available": has_ffmpeg(),

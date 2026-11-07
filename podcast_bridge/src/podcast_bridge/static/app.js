@@ -148,6 +148,13 @@ function renderDevices() {
             </div>
           </div>
 
+          ${dev.last_error ? `
+            <div style="color:#ff6b6b;font-size:12px;margin:10px 0;background:rgba(255,107,107,0.1);padding:8px 12px;border-radius:4px;border-left:3px solid #ff6b6b;">
+              <strong>Speaker Delivery Notice:</strong> ${escapeHtml(dev.last_error)}
+              <div style="margin-top:4px;color:var(--text-muted);font-size:11px;">Tip: Change Audio Delivery Transport below to <strong>Home Assistant (${escapeHtml(dev.ha_entity_id || "media_player")})</strong>, or set Apple Home App &rarr; Home Settings &rarr; Speakers &amp; TV &rarr; "Anyone on the Same Network".</div>
+            </div>
+          ` : ""}
+
           <div class="controls-strip">
             <div class="volume-box">
               <span class="volume-label" id="vol-label-${escapeHtml(dev.id)}">VOL ${dev.muted ? "MUTE" : `${volPct}%`}</span>
@@ -166,7 +173,7 @@ function renderDevices() {
               <select class="form-control" data-action="transport-change" data-id="${escapeHtml(dev.id)}" aria-label="Transport Mode">
                 <option value="pyatv_stream" ${dev.transport_mode === "pyatv_stream" ? "selected" : ""}>AirPlay Stream (pyatv + FFmpeg)</option>
                 <option value="pyatv_url" ${dev.transport_mode === "pyatv_url" ? "selected" : ""}>AirPlay URL Relay (pyatv)</option>
-                <option value="ha_media_player" ${dev.transport_mode === "ha_media_player" ? "selected" : ""}>Home Assistant (${escapeHtml(dev.ha_entity_id || "media_player")})</option>
+                <option value="ha_media_player" ${dev.transport_mode === "ha_media_player" ? "selected" : ""}>Home Assistant (${escapeHtml(dev.ha_entity_id || "media_player")}) ${dev.ha_entity_id ? "★ Recommended" : ""}</option>
                 <option value="simulated" ${dev.transport_mode === "simulated" ? "selected" : ""}>Simulated HomePod Sink (Diagnostic)</option>
               </select>
             </div>
@@ -292,10 +299,20 @@ async function handleDeviceAction(action, deviceId, extra = {}) {
     });
     const data = await res.json();
     if (res.ok && data.ok) {
-      showDiagnostic(
-        `CastV2 Session Verified (${data.elapsed_ms} ms)`,
-        data.steps.join("  →  ")
-      );
+      if (data.playback_error || data.device_last_error) {
+        const errMsg = data.playback_error || data.device_last_error;
+        showDiagnostic(
+          "Cast Handshake Verified, but HomePod Mini Notice",
+          `${errMsg}. Fix: In Apple Home app -> Home Settings -> Speakers & TV -> set 'Allow Speaker Access' to 'Anyone on the Same Network', or change Transport to Home Assistant.`,
+          true
+        );
+      } else {
+        const destDesc = data.ha_entity_id ? ` (via ${data.ha_entity_id})` : "";
+        showDiagnostic(
+          `CastV2 Session Verified (${data.elapsed_ms} ms)`,
+          `Audio active on ${data.transport_mode.toUpperCase()}${destDesc}. Cast Handshake: ` + data.steps.join(" → ")
+        );
+      }
       await fetchInitialStatus();
     } else {
       showDiagnostic("CastV2 Test Failed", data.detail || "Connection error", true);
