@@ -289,6 +289,10 @@ class AirPlayManager:
                                 async for chunk in self.relay.stream_transcoded(device.id, source_url, codec="wav", start_time=start_time):
                                     tmp.write(chunk)
                             tmp.flush()
+                            try:
+                                os.fsync(tmp.fileno())
+                            except Exception:
+                                pass
                             self._emit(
                                 device.id,
                                 device.name,
@@ -297,6 +301,8 @@ class AirPlayManager:
                                 f"Delivering PCM audio to HomePod Mini via AirPlay ({p_ver.value})",
                             )
                             await atv.stream.stream_file(tmp.name)
+                            # Allow HomePod internal AirPlay buffer (1.5-2.0s) to play completely before teardown
+                            await asyncio.sleep(1.0)
 
                     device.player_state = PlayerState.IDLE
                     device.last_error = None

@@ -21,8 +21,8 @@ def has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def generate_test_chime_wav(duration_sec: float = 2.4, sample_rate: int = 44100) -> bytes:
-    """Synthesize a warm stereo C-major9 arpeggiated chime in 16-bit 44.1kHz WAV format."""
+def generate_test_chime_wav(duration_sec: float = 4.2, sample_rate: int = 44100) -> bytes:
+    """Synthesize a warm stereo C-major9 arpeggiated chime in 16-bit 44.1kHz WAV format with trailing buffer drain."""
     buf = io.BytesIO()
     num_samples = int(duration_sec * sample_rate)
     # Frequencies: C5 (523.25), E5 (659.25), G5 (783.99), B5 (987.77), D6 (1174.66)
