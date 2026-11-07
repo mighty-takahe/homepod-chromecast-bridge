@@ -2,7 +2,7 @@ name: "PodCast: HomePod to Chromecast Audio Bridge"
 version: "0.2.0"
 slug: "podcast_bridge"
 description: "Exposes Apple HomePod Minis as native Google Cast (Chromecast Audio) devices with AirPlay 2 and Home Assistant media_player integration."
-url: "https://github.com/antigravity/homepod-chromecast-bridge"
+url: "https://github.com/mighty-takahe/homepod-chromecast-bridge"
 arch:
   - amd64
   - aarch64
@@ -23,7 +23,7 @@ options:
   web_port: 8788
   base_cast_port: 8009
   base_eureka_port: 18008
-  auth_mode: "self_signed"
+  auth_mode: "precomputed_bundle"
   audio_codec: "wav"
   audio_sample_rate: 44100
   auto_discover_homepods: true
