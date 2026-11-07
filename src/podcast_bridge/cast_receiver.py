@@ -499,7 +499,6 @@ class VirtualChromecastAudio:
                 {"name": "urn:x-cast:com.google.cast.inject"},
                 {"name": "urn:x-cast:com.google.cast.broadcast"},
                 {"name": NS_SPOTIFY},
-                {"name": NS_SPOTIFY_SHORT},
                 {"name": NS_MEDIA},
             ]
             applications.append(
@@ -692,27 +691,6 @@ class VirtualChromecastAudio:
                     self._build_media_status(request_id=0),
                 )
                 await write_cast_message(writer, media_reply)
-
-                if self.app_id == APP_SPOTIFY:
-                    # Proactively push Spotify device status to complete handshake in 0ms
-                    spotify_status = make_json_message(
-                        self.transport_id,
-                        msg.source_id,
-                        NS_SPOTIFY,
-                        {
-                            "type": "status",
-                            "device": {
-                                "name": self.device.cast_name,
-                                "device_id": self.device.cast_uuid,
-                                "device_type": "AUDIO_DONGLE",
-                                "brand_name": "Google",
-                                "model_name": "Chromecast Audio",
-                                "capabilities": {"is_speaker": True, "volume_steps": 100},
-                            },
-                        },
-                    )
-                    await write_cast_message(writer, spotify_status)
-                    self._emit("cast_out", NS_SPOTIFY, f"Proactive Spotify status sent to {msg.source_id}")
             return
 
         # 4. Receiver Namespace (GET_STATUS, LAUNCH, STOP, SET_VOLUME, GET_APP_AVAILABILITY)
@@ -980,99 +958,115 @@ class VirtualChromecastAudio:
         if ns in (NS_SPOTIFY, NS_SPOTIFY_SHORT) or "spotify.chromecast.secure" in ns:
             data = msg.json_payload()
             msg_type = data.get("type", "")
+            req_id = data.get("requestId") if "requestId" in data else data.get("request_id")
             self._emit("cast_in", ns, f"SPOTIFY {msg_type} (source={msg.source_id})", msg.payload_utf8 or "")
 
             if msg_type in ("getInfo", "get_info", "GET_INFO"):
+                resp_payload: Dict[str, Any] = {
+                    "type": "getInfoResponse",
+                    "payload": {
+                        "deviceID": self.device.cast_uuid,
+                        "device_id": self.device.cast_uuid,
+                        "version": "1.0.0",
+                        "deviceType": "audio_dongle",
+                        "brandDisplayName": "Google",
+                        "modelDisplayName": "Chromecast Audio",
+                        "aliases": [],
+                    },
+                }
+                if req_id is not None:
+                    resp_payload["requestId"] = req_id
                 reply = make_json_message(
                     msg.destination_id or self.transport_id,
                     msg.source_id,
-                    ns,
-                    {
-                        "type": "getInfoResponse",
-                        "payload": {
-                            "deviceID": self.device.cast_uuid,
-                            "device_id": self.device.cast_uuid,
-                            "version": "1.0.0",
-                            "deviceType": "audio_dongle",
-                            "brandDisplayName": "Google",
-                            "modelDisplayName": "Chromecast Audio",
-                            "aliases": [],
-                        },
-                    },
+                    NS_SPOTIFY,
+                    resp_payload,
                 )
                 await write_cast_message(writer, reply)
-                self._emit("cast_out", ns, f"Returned getInfoResponse deviceID={self.device.cast_uuid}")
+                self._emit("cast_out", NS_SPOTIFY, f"Returned getInfoResponse deviceID={self.device.cast_uuid}")
 
             elif msg_type in ("setCredentials", "set_credentials", "SET_CREDENTIALS"):
+                resp_payload = {
+                    "type": "setCredentialsResponse",
+                    "status": "OK",
+                    "payload": {
+                        "status": "OK",
+                        "deviceID": self.device.cast_uuid,
+                    },
+                }
+                if req_id is not None:
+                    resp_payload["requestId"] = req_id
                 reply = make_json_message(
                     msg.destination_id or self.transport_id,
                     msg.source_id,
-                    ns,
-                    {
-                        "type": "setCredentialsResponse",
-                        "status": "OK",
-                        "payload": {
-                            "status": "OK",
-                            "deviceID": self.device.cast_uuid,
-                        },
-                    },
+                    NS_SPOTIFY,
+                    resp_payload,
                 )
                 await write_cast_message(writer, reply)
-                self._emit("cast_out", ns, "Returned setCredentialsResponse OK")
+                self._emit("cast_out", NS_SPOTIFY, "Returned setCredentialsResponse OK")
 
             elif msg_type in ("getStatus", "get_status", "GET_STATUS", "get_device_info"):
+                resp_payload = {
+                    "type": "status",
+                    "device": {
+                        "name": self.device.cast_name,
+                        "device_id": self.device.cast_uuid,
+                        "device_type": "AUDIO_DONGLE",
+                        "brand_name": "Google",
+                        "model_name": "Chromecast Audio",
+                        "capabilities": {"is_speaker": True, "volume_steps": 100},
+                    },
+                }
+                if req_id is not None:
+                    resp_payload["requestId"] = req_id
                 reply = make_json_message(
                     msg.destination_id or self.transport_id,
                     msg.source_id,
-                    ns,
-                    {
-                        "type": "status",
-                        "device": {
-                            "name": self.device.cast_name,
-                            "device_id": self.device.cast_uuid,
-                            "device_type": "AUDIO_DONGLE",
-                            "brand_name": "Google",
-                            "model_name": "Chromecast Audio",
-                            "capabilities": {"is_speaker": True, "volume_steps": 100},
-                        },
-                    },
+                    NS_SPOTIFY,
+                    resp_payload,
                 )
                 await write_cast_message(writer, reply)
-                self._emit("cast_out", ns, f"Returned Spotify device status ({self.device.cast_name})")
+                self._emit("cast_out", NS_SPOTIFY, f"Returned Spotify device status ({self.device.cast_name})")
 
             elif msg_type in ("set_device", "setDevice", "set_users", "setUsers", "transfer"):
+                resp_payload = {
+                    "type": "set_device_response",
+                    "status": "OK",
+                    "device": {
+                        "name": self.device.cast_name,
+                        "device_id": self.device.cast_uuid,
+                    },
+                }
+                if req_id is not None:
+                    resp_payload["requestId"] = req_id
                 reply = make_json_message(
                     msg.destination_id or self.transport_id,
                     msg.source_id,
-                    ns,
-                    {
-                        "type": "set_device_response",
-                        "status": "OK",
-                        "device": {
-                            "name": self.device.cast_name,
-                            "device_id": self.device.cast_uuid,
-                        },
-                    },
+                    NS_SPOTIFY,
+                    resp_payload,
                 )
                 await write_cast_message(writer, reply)
-                self._emit("cast_out", ns, f"Acknowledged {msg_type} OK")
+                self._emit("cast_out", NS_SPOTIFY, f"Acknowledged {msg_type} OK")
 
             else:
                 resp_type = f"{msg_type}Response" if not msg_type.endswith("Response") else msg_type
+                resp_payload = {
+                    "type": resp_type,
+                    "status": "OK",
+                    "payload": {
+                        "deviceID": self.device.cast_uuid,
+                    },
+                }
+                if req_id is not None:
+                    resp_payload["requestId"] = req_id
                 reply = make_json_message(
                     msg.destination_id or self.transport_id,
                     msg.source_id,
-                    ns,
-                    {
-                        "type": resp_type,
-                        "status": "OK",
-                        "payload": {
-                            "deviceID": self.device.cast_uuid,
-                        },
-                    },
+                    NS_SPOTIFY,
+                    resp_payload,
                 )
                 await write_cast_message(writer, reply)
-                self._emit("cast_out", ns, f"Handled custom Spotify msg {msg_type} -> {resp_type}")
+                self._emit("cast_out", NS_SPOTIFY, f"Handled custom Spotify msg {msg_type} -> {resp_type}")
 
             return
 

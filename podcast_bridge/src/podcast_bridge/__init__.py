@@ -1,6 +1,6 @@
 """PodCast Bridge: Expose HomePod Minis as Google Cast (Chromecast Audio) devices."""
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 
 
 def patch_srptools_compat() -> None:

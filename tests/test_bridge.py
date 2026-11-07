@@ -324,51 +324,52 @@ async def test_spotify_custom_cast_session(tmp_path: Path):
             assert spotify_app["displayName"] == "Spotify"
             transport_id = spotify_app["transportId"]
 
-            # Verify Spotify namespace is explicitly declared in namespaces
+            # Verify all declared namespaces are strictly valid urn:x-cast: URIs (preventing Android CastSession crash)
             ns_names = [ns_item["name"] for ns_item in spotify_app["namespaces"]]
             assert NS_SPOTIFY in ns_names
+            for name in ns_names:
+                assert name.startswith("urn:x-cast:"), f"Namespace '{name}' must start with urn:x-cast:"
 
-            # 5. Connect to transportId
+            # 5. Connect to transportId (receiver immediately replies with MEDIA_STATUS)
             await write_cast_message(
                 writer,
                 make_json_message("sender-spotify", transport_id, NS_CONNECTION, {"type": "CONNECT", "origin": {}}),
             )
+            media_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
+            assert media_reply is not None and media_reply.namespace == NS_MEDIA
 
-            # Expect initial MEDIA_STATUS and proactive Spotify status
-            got_spotify_status = False
-            for _ in range(4):
-                conn_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
-                if conn_reply and conn_reply.namespace == NS_SPOTIFY:
-                    assert conn_reply.json_payload().get("type") == "status"
-                    got_spotify_status = True
-                    break
-            assert got_spotify_status is True
-
-            # 6. Test Spotify getInfo query
-            await write_cast_message(
-                writer,
-                make_json_message("sender-spotify", transport_id, NS_SPOTIFY, {"type": "getInfo", "payload": {}}),
-            )
-            info_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
-            assert info_reply is not None and info_reply.namespace == NS_SPOTIFY
-            info_data = info_reply.json_payload()
-            assert info_data["type"] == "getInfoResponse"
-            assert info_data["payload"]["deviceID"] == first_dev.cast_uuid
-
-            # 7. Test Spotify setCredentials query
+            # 6. Test Spotify getInfo query with requestId
             await write_cast_message(
                 writer,
                 make_json_message(
                     "sender-spotify",
                     transport_id,
                     NS_SPOTIFY,
-                    {"type": "setCredentials", "credentials": "fake_token", "expiresIn": 3600},
+                    {"requestId": 201, "type": "getInfo", "payload": {}},
+                ),
+            )
+            info_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
+            assert info_reply is not None and info_reply.namespace == NS_SPOTIFY
+            info_data = info_reply.json_payload()
+            assert info_data["type"] == "getInfoResponse"
+            assert info_data["requestId"] == 201
+            assert info_data["payload"]["deviceID"] == first_dev.cast_uuid
+
+            # 7. Test Spotify setCredentials query with requestId
+            await write_cast_message(
+                writer,
+                make_json_message(
+                    "sender-spotify",
+                    transport_id,
+                    NS_SPOTIFY,
+                    {"requestId": 202, "type": "setCredentials", "credentials": "fake_token", "expiresIn": 3600},
                 ),
             )
             cred_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
             assert cred_reply is not None and cred_reply.namespace == NS_SPOTIFY
             assert cred_reply.json_payload()["type"] == "setCredentialsResponse"
             assert cred_reply.json_payload()["status"] == "OK"
+            assert cred_reply.json_payload()["requestId"] == 202
 
             # 8. Test 0ms optimistic LOAD
             t_load = asyncio.get_event_loop().time()
