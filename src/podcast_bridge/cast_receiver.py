@@ -35,6 +35,8 @@ from .cast_proto import (
     NS_MULTIZONE,
     NS_RECEIVER,
     NS_SETUP,
+    NS_SPOTIFY,
+    NS_SPOTIFY_SHORT,
     NS_YOUTUBE_MDX,
     PayloadType,
     make_binary_message,
@@ -495,6 +497,9 @@ class VirtualChromecastAudio:
                 {"name": NS_SETUP},
                 {"name": NS_YOUTUBE_MDX},
                 {"name": "urn:x-cast:com.google.cast.inject"},
+                {"name": "urn:x-cast:com.google.cast.broadcast"},
+                {"name": NS_SPOTIFY},
+                {"name": NS_SPOTIFY_SHORT},
                 {"name": NS_MEDIA},
             ]
             applications.append(
@@ -597,6 +602,15 @@ class VirtualChromecastAudio:
         await self._broadcast(msg, exclude=exclude)
         self._notify_state()
 
+    async def _safe_load_media(self, content_url: str, meta: MediaMetadata, start_time: float) -> None:
+        """Stream media to the physical HomePod in the background without blocking Cast socket responses."""
+        try:
+            await self._on_load_media(self.device, content_url, meta, start_time)
+        except Exception as exc:
+            logger.warning("Error initiating physical speaker playback on '%s': %s", self.device.name, exc)
+            self.device.player_state = PlayerState.IDLE
+            await self.broadcast_media_status(request_id=0)
+
     async def _broadcast(
         self,
         msg: CastMessage,
@@ -678,6 +692,27 @@ class VirtualChromecastAudio:
                     self._build_media_status(request_id=0),
                 )
                 await write_cast_message(writer, media_reply)
+
+                if self.app_id == APP_SPOTIFY:
+                    # Proactively push Spotify device status to complete handshake in 0ms
+                    spotify_status = make_json_message(
+                        self.transport_id,
+                        msg.source_id,
+                        NS_SPOTIFY,
+                        {
+                            "type": "status",
+                            "device": {
+                                "name": self.device.cast_name,
+                                "device_id": self.device.cast_uuid,
+                                "device_type": "AUDIO_DONGLE",
+                                "brand_name": "Google",
+                                "model_name": "Chromecast Audio",
+                                "capabilities": {"is_speaker": True, "volume_steps": 100},
+                            },
+                        },
+                    )
+                    await write_cast_message(writer, spotify_status)
+                    self._emit("cast_out", NS_SPOTIFY, f"Proactive Spotify status sent to {msg.source_id}")
             return
 
         # 4. Receiver Namespace (GET_STATUS, LAUNCH, STOP, SET_VOLUME, GET_APP_AVAILABILITY)
@@ -840,8 +875,9 @@ class VirtualChromecastAudio:
                 )
                 self.device.media = meta
                 self.media_session_id += 1
+                self.device.player_state = PlayerState.PLAYING
 
-                await self._on_load_media(self.device, content_url, meta, start_time)
+                # 0ms Optimistic MEDIA_STATUS: respond immediately so sender UI connects in < 5ms
                 reply = make_json_message(
                     self.transport_id,
                     msg.source_id,
@@ -851,7 +887,10 @@ class VirtualChromecastAudio:
                 await write_cast_message(writer, reply)
                 await self.broadcast_media_status(request_id=0, exclude=writer)
                 await self.broadcast_receiver_status(request_id=0)
-                self._emit("cast_out", ns, f"MEDIA_STATUS PLAYING '{meta.title}' -> HomePod '{self.device.name}'")
+                self._emit("cast_out", ns, f"MEDIA_STATUS PLAYING '{meta.title}' -> HomePod '{self.device.name}' (optimistic 0ms)")
+
+                # Execute physical speaker streaming asynchronously
+                asyncio.create_task(self._safe_load_media(content_url, meta, start_time))
 
             elif msg_type == "PAUSE":
                 self.device.player_state = PlayerState.PAUSED
@@ -931,8 +970,109 @@ class VirtualChromecastAudio:
                 meta_raw = item_media.get("metadata", {})
                 self.device.media.title = meta_raw.get("title", url)
                 self.device.media.content_url = url
-                await self._on_load_media(self.device, url, self.device.media, 0.0)
+                self.device.player_state = PlayerState.PLAYING
                 await self.broadcast_media_status(request_id=req_id)
+                asyncio.create_task(self._safe_load_media(url, self.device.media, 0.0))
+
+            return
+
+        # 5b. Spotify Secure Channel (urn:x-cast:com.spotify.chromecast.secure.v1)
+        if ns in (NS_SPOTIFY, NS_SPOTIFY_SHORT) or "spotify.chromecast.secure" in ns:
+            data = msg.json_payload()
+            msg_type = data.get("type", "")
+            self._emit("cast_in", ns, f"SPOTIFY {msg_type} (source={msg.source_id})", msg.payload_utf8 or "")
+
+            if msg_type in ("getInfo", "get_info", "GET_INFO"):
+                reply = make_json_message(
+                    msg.destination_id or self.transport_id,
+                    msg.source_id,
+                    ns,
+                    {
+                        "type": "getInfoResponse",
+                        "payload": {
+                            "deviceID": self.device.cast_uuid,
+                            "device_id": self.device.cast_uuid,
+                            "version": "1.0.0",
+                            "deviceType": "audio_dongle",
+                            "brandDisplayName": "Google",
+                            "modelDisplayName": "Chromecast Audio",
+                            "aliases": [],
+                        },
+                    },
+                )
+                await write_cast_message(writer, reply)
+                self._emit("cast_out", ns, f"Returned getInfoResponse deviceID={self.device.cast_uuid}")
+
+            elif msg_type in ("setCredentials", "set_credentials", "SET_CREDENTIALS"):
+                reply = make_json_message(
+                    msg.destination_id or self.transport_id,
+                    msg.source_id,
+                    ns,
+                    {
+                        "type": "setCredentialsResponse",
+                        "status": "OK",
+                        "payload": {
+                            "status": "OK",
+                            "deviceID": self.device.cast_uuid,
+                        },
+                    },
+                )
+                await write_cast_message(writer, reply)
+                self._emit("cast_out", ns, "Returned setCredentialsResponse OK")
+
+            elif msg_type in ("getStatus", "get_status", "GET_STATUS", "get_device_info"):
+                reply = make_json_message(
+                    msg.destination_id or self.transport_id,
+                    msg.source_id,
+                    ns,
+                    {
+                        "type": "status",
+                        "device": {
+                            "name": self.device.cast_name,
+                            "device_id": self.device.cast_uuid,
+                            "device_type": "AUDIO_DONGLE",
+                            "brand_name": "Google",
+                            "model_name": "Chromecast Audio",
+                            "capabilities": {"is_speaker": True, "volume_steps": 100},
+                        },
+                    },
+                )
+                await write_cast_message(writer, reply)
+                self._emit("cast_out", ns, f"Returned Spotify device status ({self.device.cast_name})")
+
+            elif msg_type in ("set_device", "setDevice", "set_users", "setUsers", "transfer"):
+                reply = make_json_message(
+                    msg.destination_id or self.transport_id,
+                    msg.source_id,
+                    ns,
+                    {
+                        "type": "set_device_response",
+                        "status": "OK",
+                        "device": {
+                            "name": self.device.cast_name,
+                            "device_id": self.device.cast_uuid,
+                        },
+                    },
+                )
+                await write_cast_message(writer, reply)
+                self._emit("cast_out", ns, f"Acknowledged {msg_type} OK")
+
+            else:
+                resp_type = f"{msg_type}Response" if not msg_type.endswith("Response") else msg_type
+                reply = make_json_message(
+                    msg.destination_id or self.transport_id,
+                    msg.source_id,
+                    ns,
+                    {
+                        "type": resp_type,
+                        "status": "OK",
+                        "payload": {
+                            "deviceID": self.device.cast_uuid,
+                        },
+                    },
+                )
+                await write_cast_message(writer, reply)
+                self._emit("cast_out", ns, f"Handled custom Spotify msg {msg_type} -> {resp_type}")
 
             return
 
@@ -1218,8 +1358,15 @@ class VirtualChromecastAudio:
             elif path.startswith("/apps/"):
                 app_slug = path.split("/apps/", 1)[1].strip("/")
                 if method == "POST":
-                    self.app_id = APP_YOUTUBE_MUSIC if "Music" in app_slug else APP_YOUTUBE
-                    self.app_name = app_slug or "YouTube"
+                    if "Spotify" in app_slug:
+                        self.app_id = APP_SPOTIFY
+                        self.app_name = "Spotify"
+                    elif "Music" in app_slug:
+                        self.app_id = APP_YOUTUBE_MUSIC
+                        self.app_name = "YouTube Music"
+                    else:
+                        self.app_id = APP_YOUTUBE
+                        self.app_name = app_slug or "YouTube"
                     self.session_id = str(uuid.uuid4())
                     self.transport_id = self.session_id
                     self._emit(

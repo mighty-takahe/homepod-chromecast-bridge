@@ -15,18 +15,23 @@ from podcast_bridge.cast_auth import CastAuthManager
 from podcast_bridge.cast_client import send_test_cast_session
 from podcast_bridge.cast_proto import (
     APP_DEFAULT_MEDIA_RECEIVER,
+    APP_SPOTIFY,
     AuthChallenge,
     CastMessage,
     DeviceAuthMessage,
     HashAlgorithm,
+    NS_CONNECTION,
     NS_DEVICEAUTH,
     NS_MEDIA,
     NS_RECEIVER,
+    NS_SPOTIFY,
     PayloadType,
     SignatureAlgorithm,
     make_binary_message,
     make_json_message,
     pack_cast_message,
+    read_cast_message,
+    write_cast_message,
 )
 from podcast_bridge.models import CastAuthMode, PlayerState, TransportMode
 
@@ -236,3 +241,161 @@ async def test_e2e_virtual_chromecast_and_api(tmp_path: Path):
             )
             assert direct_cast["ok"] is True
             assert direct_cast["auth_verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_spotify_custom_cast_session(tmp_path: Path):
+    """Verify Spotify custom app (CC32E753) launch, namespace declaration, and secure channel handshake."""
+    import ssl
+    import os
+
+    app = create_app(data_dir=tmp_path, web_port=18789, mdns_enabled=False)
+    manager = app.state.bridge
+    manager.settings.base_cast_port = 19209
+    manager.settings.base_eureka_port = 19308
+
+    async with app.router.lifespan_context(app):
+        first_dev = list(manager.devices.values())[0]
+        cast_port = first_dev.cast_port
+
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", cast_port, ssl=ssl_ctx),
+            timeout=5.0,
+        )
+
+        try:
+            # 1. Virtual connection
+            await write_cast_message(
+                writer,
+                make_json_message("sender-spotify", "receiver-0", NS_CONNECTION, {"type": "CONNECT", "origin": {}}),
+            )
+
+            # 2. Device authentication challenge
+            nonce = os.urandom(16)
+            ch = DeviceAuthMessage(
+                challenge=AuthChallenge(
+                    signature_algorithm=SignatureAlgorithm.RSASSA_PKCS1v15,
+                    sender_nonce=nonce,
+                    hash_algorithm=HashAlgorithm.SHA256,
+                )
+            )
+            await write_cast_message(
+                writer,
+                make_binary_message("sender-spotify", "receiver-0", NS_DEVICEAUTH, ch.SerializeToString()),
+            )
+            auth_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
+            assert auth_reply is not None and auth_reply.namespace == NS_DEVICEAUTH
+
+            # 3. Check App Availability for Spotify (CC32E753)
+            await write_cast_message(
+                writer,
+                make_json_message(
+                    "sender-spotify",
+                    "receiver-0",
+                    NS_RECEIVER,
+                    {"requestId": 101, "type": "GET_APP_AVAILABILITY", "appId": [APP_SPOTIFY]},
+                ),
+            )
+            avail_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
+            assert avail_reply is not None and avail_reply.namespace == NS_RECEIVER
+            assert avail_reply.json_payload()["availability"][APP_SPOTIFY] == "APP_AVAILABLE"
+
+            # 4. LAUNCH Spotify app
+            await write_cast_message(
+                writer,
+                make_json_message(
+                    "sender-spotify",
+                    "receiver-0",
+                    NS_RECEIVER,
+                    {"requestId": 102, "type": "LAUNCH", "appId": APP_SPOTIFY},
+                ),
+            )
+            launch_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
+            assert launch_reply is not None and launch_reply.namespace == NS_RECEIVER
+            payload = launch_reply.json_payload()
+            apps = payload["status"]["applications"]
+            assert len(apps) == 1
+            spotify_app = apps[0]
+            assert spotify_app["appId"] == APP_SPOTIFY
+            assert spotify_app["displayName"] == "Spotify"
+            transport_id = spotify_app["transportId"]
+
+            # Verify Spotify namespace is explicitly declared in namespaces
+            ns_names = [ns_item["name"] for ns_item in spotify_app["namespaces"]]
+            assert NS_SPOTIFY in ns_names
+
+            # 5. Connect to transportId
+            await write_cast_message(
+                writer,
+                make_json_message("sender-spotify", transport_id, NS_CONNECTION, {"type": "CONNECT", "origin": {}}),
+            )
+
+            # Expect initial MEDIA_STATUS and proactive Spotify status
+            got_spotify_status = False
+            for _ in range(4):
+                conn_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
+                if conn_reply and conn_reply.namespace == NS_SPOTIFY:
+                    assert conn_reply.json_payload().get("type") == "status"
+                    got_spotify_status = True
+                    break
+            assert got_spotify_status is True
+
+            # 6. Test Spotify getInfo query
+            await write_cast_message(
+                writer,
+                make_json_message("sender-spotify", transport_id, NS_SPOTIFY, {"type": "getInfo", "payload": {}}),
+            )
+            info_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
+            assert info_reply is not None and info_reply.namespace == NS_SPOTIFY
+            info_data = info_reply.json_payload()
+            assert info_data["type"] == "getInfoResponse"
+            assert info_data["payload"]["deviceID"] == first_dev.cast_uuid
+
+            # 7. Test Spotify setCredentials query
+            await write_cast_message(
+                writer,
+                make_json_message(
+                    "sender-spotify",
+                    transport_id,
+                    NS_SPOTIFY,
+                    {"type": "setCredentials", "credentials": "fake_token", "expiresIn": 3600},
+                ),
+            )
+            cred_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
+            assert cred_reply is not None and cred_reply.namespace == NS_SPOTIFY
+            assert cred_reply.json_payload()["type"] == "setCredentialsResponse"
+            assert cred_reply.json_payload()["status"] == "OK"
+
+            # 8. Test 0ms optimistic LOAD
+            t_load = asyncio.get_event_loop().time()
+            await write_cast_message(
+                writer,
+                make_json_message(
+                    "sender-spotify",
+                    transport_id,
+                    NS_MEDIA,
+                    {
+                        "requestId": 103,
+                        "type": "LOAD",
+                        "media": {
+                            "contentId": "spotify:track:12345",
+                            "metadata": {"title": "Spotify Test Track", "artist": "Spotify Artist"},
+                        },
+                    },
+                ),
+            )
+            load_reply = await asyncio.wait_for(read_cast_message(reader), timeout=2.0)
+            load_latency = asyncio.get_event_loop().time() - t_load
+            assert load_latency < 0.2  # Must respond in sub-second (optimistic 0ms)
+            assert load_reply is not None and load_reply.namespace == NS_MEDIA
+            media_data = load_reply.json_payload()
+            assert media_data["status"][0]["playerState"] == "PLAYING"
+            assert media_data["status"][0]["media"]["metadata"]["title"] == "Spotify Test Track"
+
+        finally:
+            writer.close()
+            await writer.wait_closed()

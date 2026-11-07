@@ -609,7 +609,7 @@ class BridgeManager:
 
     def get_status_summary(self) -> Dict[str, Any]:
         return {
-            "version": "0.4.2",
+            "version": "0.4.3",
             "host_ip": self.settings.host_ip,
             "web_port": self.web_port,
             "ffmpeg_available": has_ffmpeg(),

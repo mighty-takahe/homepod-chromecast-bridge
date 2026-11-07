@@ -25,6 +25,8 @@ NS_PROXIMITY = "urn:x-cast:com.google.cast.proximity"
 NS_MEDIA = "urn:x-cast:com.google.cast.media"
 NS_YOUTUBE_MDX = "urn:x-cast:com.google.youtube.mdx"
 NS_MULTIZONE = "urn:x-cast:com.google.cast.multizone"
+NS_SPOTIFY = "urn:x-cast:com.spotify.chromecast.secure.v1"
+NS_SPOTIFY_SHORT = "com.spotify.chromecast.secure.v1"
 
 # Chromecast Audio full capability bitmask:
 # 4 (AUDIO_OUT) | 256 (HI_RES_AUDIO) | 512 (MULTIZONE) | 2048 | 65536 | 131072 = 199428
