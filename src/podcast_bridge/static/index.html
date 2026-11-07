@@ -108,15 +108,6 @@
           </div>
         </div>
 
-        <div class="diagnostic-banner" style="margin: 0 0 18px 0; border-color: var(--accent-amber);">
-          <div class="diagnostic-content">
-            <strong style="color: var(--accent-amber);">Why aren't speakers appearing in my phone/browser Cast menu yet? (Local Wi-Fi / LAN Required)</strong>
-            <p>
-              Google Cast discovery (<code>_googlecast._tcp.local.</code> on UDP <code>224.0.0.251:5353</code>) and Apple AirPlay (<code>_airplay._tcp.local.</code>) are <strong>link-local multicast protocols</strong> that cannot cross the internet from this remote preview container into your home Wi-Fi. To see your HomePod Minis inside YouTube Music, Spotify, Chrome, or Android apps on your phone, deploy this repository on your <strong>Home Assistant server</strong> (Add-on Store) or a machine on your home LAN with <code>--network host</code>.
-            </p>
-          </div>
-        </div>
-
         <div id="devices-grid" class="devices-grid">
           <!-- Populated dynamically by app.js -->
         </div>
