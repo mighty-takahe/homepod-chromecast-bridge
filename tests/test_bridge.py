@@ -338,14 +338,23 @@ async def test_spotify_custom_cast_session(tmp_path: Path):
             media_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
             assert media_reply is not None and media_reply.namespace == NS_MEDIA
 
-            # 6. Test Spotify getInfo query with requestId
+            # 6. Test Spotify getInfo query with requested deviceID and requestId
+            test_client_dev_id = "spotify-client-uuid-999"
             await write_cast_message(
                 writer,
                 make_json_message(
                     "sender-spotify",
                     transport_id,
                     NS_SPOTIFY,
-                    {"requestId": 201, "type": "getInfo", "payload": {}},
+                    {
+                        "requestId": 201,
+                        "type": "getInfo",
+                        "payload": {
+                            "remoteName": "Test Remote",
+                            "deviceID": test_client_dev_id,
+                            "deviceAPI_isGroup": False,
+                        },
+                    },
                 ),
             )
             info_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
@@ -353,25 +362,66 @@ async def test_spotify_custom_cast_session(tmp_path: Path):
             info_data = info_reply.json_payload()
             assert info_data["type"] == "getInfoResponse"
             assert info_data["requestId"] == 201
-            assert info_data["payload"]["deviceID"] == first_dev.cast_uuid
+            assert info_data["status"] == "OK"
+            assert info_data["payload"]["deviceID"] == test_client_dev_id
+            assert info_data["payload"]["clientID"] == "76642c7bcc9c466bb99a44ce206edbbe"
+            assert info_data["payload"]["tokenType"] == "accesstoken"
+            assert info_data["payload"]["deviceAPI_isGroup"] is False
 
-            # 7. Test Spotify setCredentials query with requestId
+            # 7. Test Spotify addUser handshake
             await write_cast_message(
                 writer,
                 make_json_message(
                     "sender-spotify",
                     transport_id,
                     NS_SPOTIFY,
-                    {"requestId": 202, "type": "setCredentials", "credentials": "fake_token", "expiresIn": 3600},
+                    {
+                        "requestId": 202,
+                        "type": "addUser",
+                        "payload": {"blob": "test_access_token_blob", "tokenType": "accesstoken"},
+                    },
+                ),
+            )
+            add_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
+            assert add_reply is not None and add_reply.namespace == NS_SPOTIFY
+            add_data = add_reply.json_payload()
+            assert add_data["type"] == "addUserResponse"
+            assert add_data["requestId"] == 202
+            assert add_data["status"] == "OK"
+            assert add_data["payload"]["status"] == "OK"
+
+            # 8. Test Spotify setCredentials query with requestId
+            await write_cast_message(
+                writer,
+                make_json_message(
+                    "sender-spotify",
+                    transport_id,
+                    NS_SPOTIFY,
+                    {"requestId": 203, "type": "setCredentials", "credentials": "fake_token", "expiresIn": 3600},
                 ),
             )
             cred_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
             assert cred_reply is not None and cred_reply.namespace == NS_SPOTIFY
             assert cred_reply.json_payload()["type"] == "setCredentialsResponse"
             assert cred_reply.json_payload()["status"] == "OK"
-            assert cred_reply.json_payload()["requestId"] == 202
+            assert cred_reply.json_payload()["requestId"] == 203
 
-            # 8. Test 0ms optimistic LOAD
+            # 9. Test Spotify resetUsers query
+            await write_cast_message(
+                writer,
+                make_json_message(
+                    "sender-spotify",
+                    transport_id,
+                    NS_SPOTIFY,
+                    {"requestId": 204, "type": "resetUsers"},
+                ),
+            )
+            reset_reply = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
+            assert reset_reply is not None and reset_reply.namespace == NS_SPOTIFY
+            assert reset_reply.json_payload()["type"] == "resetUsersResponse"
+            assert reset_reply.json_payload()["status"] == "OK"
+
+            # 10. Test 0ms optimistic LOAD
             t_load = asyncio.get_event_loop().time()
             await write_cast_message(
                 writer,
@@ -400,3 +450,58 @@ async def test_spotify_custom_cast_session(tmp_path: Path):
         finally:
             writer.close()
             await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_kitchen_retention_and_ha_dual_discovery(tmp_path: Path):
+    """Verify Kitchen HomePod Mini is retained when real Living Room is added, and HA entities auto-register."""
+    from unittest.mock import AsyncMock
+    from podcast_bridge.bridge_manager import BridgeManager
+    from podcast_bridge.models import TransportMode
+
+    mgr = BridgeManager(data_dir=tmp_path, web_port=18790, mdns_enabled=False)
+    # Mock HA client to return a Kitchen HomePod entity
+    mgr.ha_client.discover_media_players = AsyncMock(return_value=[
+        {
+            "entity_id": "media_player.kitchen_homepod_mini",
+            "friendly_name": "Kitchen HomePod Mini",
+            "is_homepod": True,
+            "device_class": "speaker",
+        }
+    ])
+
+    await mgr.start(seed_default_if_empty=True)
+
+    # Verify both Living Room and Kitchen are present
+    dev_names = [d.name for d in mgr.devices.values()]
+    assert any("kitchen" in n.lower() for n in dev_names)
+    assert any("living" in n.lower() for n in dev_names)
+
+    # Now simulate finding a physical Living Room HomePod on LAN
+    await mgr.register_device(
+        name="Living Room HomePod Mini",
+        cast_name="Living Room HomePod Mini (Cast)",
+        ip_address="192.168.1.55",
+        airplay_port=7000,
+        model="AudioAccessory5,1",
+        transport_mode=TransportMode.PYATV_STREAM,
+        start_immediately=False,
+    )
+
+    # Run selective purge
+    await mgr._purge_seeded_simulated_if_real_present()
+
+    # Living Room seeded demo (192.168.1.142) was purged because real Living Room exists,
+    # but Kitchen HomePod Mini MUST STILL EXIST!
+    after_devs = [d.name for d in mgr.devices.values()]
+    assert any("kitchen" in n.lower() for n in after_devs), "Kitchen HomePod Mini was mistakenly purged!"
+    assert any("living" in n.lower() for n in after_devs)
+
+    # Test scan_all: HA media_player.kitchen_homepod_mini auto-links
+    mgr.airplay_manager.scan_network = AsyncMock(return_value=[])
+    scan_res = await mgr.scan_all()
+    assert len(scan_res["ha_entities"]) == 1
+    kitchen_dev = next(d for d in mgr.devices.values() if "kitchen" in d.name.lower())
+    assert kitchen_dev.ha_entity_id == "media_player.kitchen_homepod_mini"
+
+    await mgr.stop()

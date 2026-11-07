@@ -364,21 +364,45 @@ class VirtualChromecastAudio:
     async def start(self) -> None:
         """Start the CastV2 TLS server, Eureka/DIAL HTTP+HTTPS servers, and mDNS service."""
         ssl_ctx = self.auth_manager.create_ssl_context()
-        self._tls_server = await asyncio.start_server(
-            self._handle_tls_client,
-            host="0.0.0.0",
-            port=self.device.cast_port,
-            ssl=ssl_ctx,
-        )
-        if self._tls_server.sockets:
+        for attempt in range(10):
+            try:
+                self._tls_server = await asyncio.start_server(
+                    self._handle_tls_client,
+                    host="0.0.0.0",
+                    port=self.device.cast_port,
+                    ssl=ssl_ctx,
+                )
+                break
+            except OSError as exc:
+                if attempt == 9:
+                    raise
+                logger.warning(
+                    "Port %s already in use for %s TLS server, retrying on %s",
+                    self.device.cast_port, self.device.name, self.device.cast_port + 1
+                )
+                self.device.cast_port += 1
+
+        if self._tls_server and self._tls_server.sockets:
             self.device.cast_port = self._tls_server.sockets[0].getsockname()[1]
 
-        self._http_server = await asyncio.start_server(
-            self._handle_http_client,
-            host="0.0.0.0",
-            port=self.device.eureka_port,
-        )
-        if self._http_server.sockets:
+        for attempt in range(10):
+            try:
+                self._http_server = await asyncio.start_server(
+                    self._handle_http_client,
+                    host="0.0.0.0",
+                    port=self.device.eureka_port,
+                )
+                break
+            except OSError as exc:
+                if attempt == 9:
+                    raise
+                logger.warning(
+                    "Port %s already in use for %s HTTP server, retrying on %s",
+                    self.device.eureka_port, self.device.name, self.device.eureka_port + 1
+                )
+                self.device.eureka_port += 1
+
+        if self._http_server and self._http_server.sockets:
             self.device.eureka_port = self._http_server.sockets[0].getsockname()[1]
 
         # If this is the primary receiver (port 8009), also bind standard Eureka HTTP :8008 and HTTPS :8443 if free
@@ -961,16 +985,30 @@ class VirtualChromecastAudio:
             req_id = data.get("requestId") if "requestId" in data else data.get("request_id")
             self._emit("cast_in", ns, f"SPOTIFY {msg_type} (source={msg.source_id})", msg.payload_utf8 or "")
 
+            payload_in = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+            req_device_id = (
+                payload_in.get("deviceID")
+                or payload_in.get("device_id")
+                or data.get("deviceID")
+                or data.get("device_id")
+                or self.device.cast_uuid
+            )
+
             if msg_type in ("getInfo", "get_info", "GET_INFO"):
                 resp_payload: Dict[str, Any] = {
                     "type": "getInfoResponse",
+                    "status": "OK",
                     "payload": {
-                        "deviceID": self.device.cast_uuid,
-                        "device_id": self.device.cast_uuid,
+                        "deviceID": req_device_id,
+                        "device_id": req_device_id,
+                        "remoteName": self.device.cast_name,
                         "version": "1.0.0",
                         "deviceType": "audio_dongle",
                         "brandDisplayName": "Google",
                         "modelDisplayName": "Chromecast Audio",
+                        "clientID": "76642c7bcc9c466bb99a44ce206edbbe",
+                        "tokenType": "accesstoken",
+                        "deviceAPI_isGroup": False,
                         "aliases": [],
                     },
                 }
@@ -979,11 +1017,31 @@ class VirtualChromecastAudio:
                 reply = make_json_message(
                     msg.destination_id or self.transport_id,
                     msg.source_id,
-                    NS_SPOTIFY,
+                    msg.namespace,
                     resp_payload,
                 )
                 await write_cast_message(writer, reply)
-                self._emit("cast_out", NS_SPOTIFY, f"Returned getInfoResponse deviceID={self.device.cast_uuid}")
+                self._emit("cast_out", msg.namespace, f"Returned getInfoResponse deviceID={req_device_id} clientID=76642c7bcc9c466bb99a44ce206edbbe")
+
+            elif msg_type in ("addUser", "add_user", "ADD_USER"):
+                resp_payload = {
+                    "type": "addUserResponse",
+                    "status": "OK",
+                    "payload": {
+                        "status": "OK",
+                        "deviceID": req_device_id,
+                    },
+                }
+                if req_id is not None:
+                    resp_payload["requestId"] = req_id
+                reply = make_json_message(
+                    msg.destination_id or self.transport_id,
+                    msg.source_id,
+                    msg.namespace,
+                    resp_payload,
+                )
+                await write_cast_message(writer, reply)
+                self._emit("cast_out", msg.namespace, f"Returned addUserResponse status=OK deviceID={req_device_id}")
 
             elif msg_type in ("setCredentials", "set_credentials", "SET_CREDENTIALS"):
                 resp_payload = {
@@ -991,7 +1049,7 @@ class VirtualChromecastAudio:
                     "status": "OK",
                     "payload": {
                         "status": "OK",
-                        "deviceID": self.device.cast_uuid,
+                        "deviceID": req_device_id,
                     },
                 }
                 if req_id is not None:
@@ -999,34 +1057,79 @@ class VirtualChromecastAudio:
                 reply = make_json_message(
                     msg.destination_id or self.transport_id,
                     msg.source_id,
-                    NS_SPOTIFY,
+                    msg.namespace,
                     resp_payload,
                 )
                 await write_cast_message(writer, reply)
-                self._emit("cast_out", NS_SPOTIFY, "Returned setCredentialsResponse OK")
+                self._emit("cast_out", msg.namespace, "Returned setCredentialsResponse OK")
+
+            elif msg_type in ("resetUsers", "reset_users", "RESET_USERS"):
+                resp_payload = {
+                    "type": "resetUsersResponse",
+                    "status": "OK",
+                    "payload": {
+                        "status": "OK",
+                    },
+                }
+                if req_id is not None:
+                    resp_payload["requestId"] = req_id
+                reply = make_json_message(
+                    msg.destination_id or self.transport_id,
+                    msg.source_id,
+                    msg.namespace,
+                    resp_payload,
+                )
+                await write_cast_message(writer, reply)
+                self._emit("cast_out", msg.namespace, "Returned resetUsersResponse OK")
+
+            elif msg_type in ("getUsers", "getUser", "get_users", "GET_USERS"):
+                resp_payload = {
+                    "type": "getUsersResponse",
+                    "status": "OK",
+                    "payload": {
+                        "status": "OK",
+                        "users": [],
+                        "deviceID": req_device_id,
+                    },
+                }
+                if req_id is not None:
+                    resp_payload["requestId"] = req_id
+                reply = make_json_message(
+                    msg.destination_id or self.transport_id,
+                    msg.source_id,
+                    msg.namespace,
+                    resp_payload,
+                )
+                await write_cast_message(writer, reply)
+                self._emit("cast_out", msg.namespace, "Returned getUsersResponse OK")
 
             elif msg_type in ("getStatus", "get_status", "GET_STATUS", "get_device_info"):
                 resp_payload = {
                     "type": "status",
+                    "status": "OK",
                     "device": {
                         "name": self.device.cast_name,
-                        "device_id": self.device.cast_uuid,
+                        "device_id": req_device_id,
                         "device_type": "AUDIO_DONGLE",
                         "brand_name": "Google",
                         "model_name": "Chromecast Audio",
                         "capabilities": {"is_speaker": True, "volume_steps": 100},
                     },
+                    "payload": {
+                        "status": "OK",
+                        "deviceID": req_device_id,
+                    },
                 }
                 if req_id is not None:
                     resp_payload["requestId"] = req_id
                 reply = make_json_message(
                     msg.destination_id or self.transport_id,
                     msg.source_id,
-                    NS_SPOTIFY,
+                    msg.namespace,
                     resp_payload,
                 )
                 await write_cast_message(writer, reply)
-                self._emit("cast_out", NS_SPOTIFY, f"Returned Spotify device status ({self.device.cast_name})")
+                self._emit("cast_out", msg.namespace, f"Returned Spotify device status ({self.device.cast_name})")
 
             elif msg_type in ("set_device", "setDevice", "set_users", "setUsers", "transfer"):
                 resp_payload = {
@@ -1034,7 +1137,11 @@ class VirtualChromecastAudio:
                     "status": "OK",
                     "device": {
                         "name": self.device.cast_name,
-                        "device_id": self.device.cast_uuid,
+                        "device_id": req_device_id,
+                    },
+                    "payload": {
+                        "status": "OK",
+                        "deviceID": req_device_id,
                     },
                 }
                 if req_id is not None:
@@ -1042,11 +1149,80 @@ class VirtualChromecastAudio:
                 reply = make_json_message(
                     msg.destination_id or self.transport_id,
                     msg.source_id,
-                    NS_SPOTIFY,
+                    msg.namespace,
                     resp_payload,
                 )
                 await write_cast_message(writer, reply)
-                self._emit("cast_out", NS_SPOTIFY, f"Acknowledged {msg_type} OK")
+                self._emit("cast_out", msg.namespace, f"Acknowledged {msg_type} OK")
+
+            elif msg_type in ("setVolume", "set_volume", "SET_VOLUME"):
+                vol = payload_in.get("volume", data.get("volume"))
+                if vol is not None:
+                    try:
+                        val = float(vol)
+                        if val > 1.0:
+                            val /= 100.0
+                        self.device.volume = round(max(0.0, min(1.0, val)), 3)
+                        asyncio.create_task(self._on_volume(self.device, self.device.volume, self.device.muted))
+                    except Exception:
+                        pass
+                resp_payload = {
+                    "type": "setVolumeResponse",
+                    "status": "OK",
+                    "payload": {
+                        "status": "OK",
+                        "volume": self.device.volume,
+                        "deviceID": req_device_id,
+                    },
+                }
+                if req_id is not None:
+                    resp_payload["requestId"] = req_id
+                reply = make_json_message(
+                    msg.destination_id or self.transport_id,
+                    msg.source_id,
+                    msg.namespace,
+                    resp_payload,
+                )
+                await write_cast_message(writer, reply)
+                self._emit("cast_out", msg.namespace, f"Set Spotify volume {self.device.volume}")
+
+            elif msg_type in ("pause", "PAUSE"):
+                self.device.player_state = PlayerState.PAUSED
+                asyncio.create_task(self._on_pause(self.device))
+                resp_payload = {
+                    "type": "pauseResponse",
+                    "status": "OK",
+                    "payload": {"status": "OK", "deviceID": req_device_id},
+                }
+                if req_id is not None:
+                    resp_payload["requestId"] = req_id
+                reply = make_json_message(
+                    msg.destination_id or self.transport_id,
+                    msg.source_id,
+                    msg.namespace,
+                    resp_payload,
+                )
+                await write_cast_message(writer, reply)
+                self._emit("cast_out", msg.namespace, "Spotify pause OK")
+
+            elif msg_type in ("play", "PLAY", "resume", "RESUME"):
+                self.device.player_state = PlayerState.PLAYING
+                asyncio.create_task(self._on_resume(self.device))
+                resp_payload = {
+                    "type": "playResponse",
+                    "status": "OK",
+                    "payload": {"status": "OK", "deviceID": req_device_id},
+                }
+                if req_id is not None:
+                    resp_payload["requestId"] = req_id
+                reply = make_json_message(
+                    msg.destination_id or self.transport_id,
+                    msg.source_id,
+                    msg.namespace,
+                    resp_payload,
+                )
+                await write_cast_message(writer, reply)
+                self._emit("cast_out", msg.namespace, "Spotify play OK")
 
             else:
                 resp_type = f"{msg_type}Response" if not msg_type.endswith("Response") else msg_type
@@ -1054,7 +1230,8 @@ class VirtualChromecastAudio:
                     "type": resp_type,
                     "status": "OK",
                     "payload": {
-                        "deviceID": self.device.cast_uuid,
+                        "status": "OK",
+                        "deviceID": req_device_id,
                     },
                 }
                 if req_id is not None:
@@ -1062,11 +1239,11 @@ class VirtualChromecastAudio:
                 reply = make_json_message(
                     msg.destination_id or self.transport_id,
                     msg.source_id,
-                    NS_SPOTIFY,
+                    msg.namespace,
                     resp_payload,
                 )
                 await write_cast_message(writer, reply)
-                self._emit("cast_out", NS_SPOTIFY, f"Handled custom Spotify msg {msg_type} -> {resp_type}")
+                self._emit("cast_out", msg.namespace, f"Handled custom Spotify msg {msg_type} -> {resp_type}")
 
             return
 

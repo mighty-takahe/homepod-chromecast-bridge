@@ -194,8 +194,16 @@ class BridgeManager:
                     return False
         return False
 
+    def _find_device_matching_ha_name(self, ha_name: str) -> Optional[HomePodDevice]:
+        ha_norm = "".join(c for c in ha_name.lower() if c.isalnum())
+        for dev in self.devices.values():
+            dev_norm = "".join(c for c in dev.name.lower() if c.isalnum())
+            if ha_norm and dev_norm and (ha_norm in dev_norm or dev_norm in ha_norm):
+                return dev
+        return None
+
     async def _purge_seeded_simulated_if_real_present(self) -> bool:
-        """Remove the 2 default seeded demo devices once real HomePod Minis are present and compact ports to 8009+."""
+        """Selectively remove seeded demo devices when replaced by real or HA HomePod Minis."""
         real_devs = [
             d for d in self.devices.values()
             if d.transport_mode != TransportMode.SIMULATED
@@ -203,16 +211,28 @@ class BridgeManager:
         if not real_devs:
             return False
 
-        seeded_ids = [
-            did for did, d in self.devices.items()
+        has_real_living = any("living" in d.name.lower() or "living" in (d.ha_entity_id or "").lower() for d in real_devs)
+        has_real_kitchen = any("kitchen" in d.name.lower() or "kitchen" in (d.ha_entity_id or "").lower() for d in real_devs)
+
+        seeded_devs = [
+            d for d in self.devices.values()
             if d.transport_mode == TransportMode.SIMULATED and d.ip_address in SEEDED_DEMO_IPS
         ]
+
         changed = False
-        for did in seeded_ids:
-            await self.stop_receiver(did)
-            self.devices.pop(did, None)
-            self._broadcast_ws({"type": "device_deleted", "device_id": did})
-            changed = True
+        for s_dev in seeded_devs:
+            s_name = s_dev.name.lower()
+            should_purge = False
+            if "living" in s_name and (has_real_living or len(real_devs) >= 2):
+                should_purge = True
+            elif "kitchen" in s_name and (has_real_kitchen or len(real_devs) >= 2):
+                should_purge = True
+
+            if should_purge:
+                await self.stop_receiver(s_dev.id)
+                self.devices.pop(s_dev.id, None)
+                self._broadcast_ws({"type": "device_deleted", "device_id": s_dev.id})
+                changed = True
 
         # Compact ports starting at base_cast_port (8009) if any real device was pushed to 8011+ by seeded demos
         used_ports = [d.cast_port for d in self.devices.values()]
@@ -232,9 +252,17 @@ class BridgeManager:
         """Start the bridge manager, discover HomePods, and launch virtual Chromecast Audio servers."""
         ha_players = await self.ha_client.discover_media_players()
 
-        if (not self.devices or not self._has_real_devices()) and seed_default_if_empty and self.settings.mdns_enabled:
-            # Perform a network scan on startup so real HomePod Minis replace any seeded demo devices
-            scanned = await self.airplay_manager.scan_network(timeout=3)
+        should_scan = (
+            self.settings.mdns_enabled
+            and (
+                not self.devices
+                or len(self.devices) < 2
+                or any(d.transport_mode == TransportMode.SIMULATED for d in self.devices.values())
+            )
+        )
+        if should_scan and seed_default_if_empty:
+            # Perform a 6s network scan on startup so real HomePod Minis replace any seeded demo devices
+            scanned = await self.airplay_manager.scan_network(timeout=6)
             for item in scanned:
                 if item.get("is_homepod", True):
                     matched_ha = None
@@ -255,6 +283,25 @@ class BridgeManager:
                         ha_entity_id=matched_ha,
                         start_immediately=False,
                     )
+
+        # Auto-register HomePods discovered in Home Assistant if not found via mDNS
+        for p in ha_players:
+            if p.get("is_homepod") or "kitchen" in p.get("friendly_name", "").lower() or "kitchen" in p.get("entity_id", "").lower():
+                existing = any(d.ha_entity_id == p["entity_id"] for d in self.devices.values())
+                if not existing:
+                    matched_dev = self._find_device_matching_ha_name(p["friendly_name"])
+                    if matched_dev:
+                        if not matched_dev.ha_entity_id:
+                            matched_dev.ha_entity_id = p["entity_id"]
+                    else:
+                        await self.register_device(
+                            name=p["friendly_name"],
+                            ip_address="127.0.0.1",
+                            transport_mode=TransportMode.HA_MEDIA_PLAYER,
+                            ha_entity_id=p["entity_id"],
+                            start_immediately=False,
+                        )
+                        logger.info("Auto-registered HomePod from Home Assistant: %s (%s)", p["friendly_name"], p["entity_id"])
 
         for dev in self.devices.values():
             if not dev.ha_entity_id:
@@ -289,6 +336,33 @@ class BridgeManager:
                 ha_entity_id="media_player.kitchen_homepod_mini",
                 start_immediately=False,
             )
+        elif seed_default_if_empty:
+            has_living = any("living" in d.name.lower() or "living" in (d.ha_entity_id or "").lower() for d in self.devices.values())
+            has_kitchen = any("kitchen" in d.name.lower() or "kitchen" in (d.ha_entity_id or "").lower() for d in self.devices.values())
+            if not has_living:
+                await self.register_device(
+                    name="Living Room HomePod Mini",
+                    cast_name="Living Room HomePod Mini (Cast)",
+                    ip_address="192.168.1.142",
+                    airplay_port=7000,
+                    model="AudioAccessory5,1",
+                    mac_address="D0:81:7A:31:9C:10",
+                    transport_mode=TransportMode.SIMULATED,
+                    ha_entity_id="media_player.living_room_homepod_mini",
+                    start_immediately=False,
+                )
+            if not has_kitchen:
+                await self.register_device(
+                    name="Kitchen HomePod Mini",
+                    cast_name="Kitchen HomePod Mini (Cast)",
+                    ip_address="192.168.1.143",
+                    airplay_port=7000,
+                    model="AudioAccessory5,1",
+                    mac_address="D0:81:7A:31:9C:22",
+                    transport_mode=TransportMode.SIMULATED,
+                    ha_entity_id="media_player.kitchen_homepod_mini",
+                    start_immediately=False,
+                )
 
         for dev in list(self.devices.values()):
             if dev.enabled:
@@ -559,7 +633,7 @@ class BridgeManager:
 
     async def scan_all(self) -> Dict[str, Any]:
         """Scan LAN via pyatv (AirPlay/RAOP) and query Home Assistant media_player entities."""
-        airplay_found = await self.airplay_manager.scan_network(timeout=4)
+        airplay_found = await self.airplay_manager.scan_network(timeout=6)
         ha_players = await self.ha_client.discover_media_players()
 
         has_explicit_homepod = any(item.get("is_homepod") for item in airplay_found)
@@ -586,6 +660,26 @@ class BridgeManager:
                 )
                 newly_added.append(dev.id)
 
+        # Auto-register HomePods from Home Assistant if not found by mDNS
+        for p in ha_players:
+            if p.get("is_homepod") or "kitchen" in p.get("friendly_name", "").lower() or "kitchen" in p.get("entity_id", "").lower():
+                existing = any(d.ha_entity_id == p["entity_id"] for d in self.devices.values())
+                if not existing:
+                    matched_dev = self._find_device_matching_ha_name(p["friendly_name"])
+                    if matched_dev:
+                        if not matched_dev.ha_entity_id:
+                            matched_dev.ha_entity_id = p["entity_id"]
+                    else:
+                        dev = await self.register_device(
+                            name=p["friendly_name"],
+                            ip_address="127.0.0.1",
+                            transport_mode=TransportMode.HA_MEDIA_PLAYER,
+                            ha_entity_id=p["entity_id"],
+                            start_immediately=False,
+                        )
+                        newly_added.append(dev.id)
+                        logger.info("Auto-registered HomePod from Home Assistant: %s (%s)", dev.name, p["entity_id"])
+
         # Auto-match existing devices with Home Assistant media_players
         for dev in self.devices.values():
             if not dev.ha_entity_id:
@@ -609,7 +703,7 @@ class BridgeManager:
 
     def get_status_summary(self) -> Dict[str, Any]:
         return {
-            "version": "0.4.4",
+            "version": "0.4.5",
             "host_ip": self.settings.host_ip,
             "web_port": self.web_port,
             "ffmpeg_available": has_ffmpeg(),

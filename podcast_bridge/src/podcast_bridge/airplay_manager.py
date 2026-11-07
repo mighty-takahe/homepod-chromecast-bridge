@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import ipaddress
 import logging
+import os
 import tempfile
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -55,8 +56,8 @@ class AirPlayManager:
         if self._on_event:
             self._on_event(device_id, device_name, direction, namespace, summary, payload_preview)
 
-    async def scan_network(self, timeout: int = 5, include_all_airplay: bool = True) -> List[Dict[str, Any]]:
-        """Scan LAN for HomePod Minis and AirPlay receivers using pyatv."""
+    async def scan_network(self, timeout: int = 6, include_all_airplay: bool = True) -> List[Dict[str, Any]]:
+        """Scan LAN for HomePod Minis and AirPlay receivers using pyatv (6s timeout with AirPlay/RAOP/Companion/MRP fallback)."""
         loop = asyncio.get_running_loop()
         discovered: List[Dict[str, Any]] = []
         try:
@@ -68,7 +69,9 @@ class AirPlayManager:
         for dev in atvs:
             airplay_svc = dev.get_service(Protocol.AirPlay)
             raop_svc = dev.get_service(Protocol.RAOP)
-            if not airplay_svc and not raop_svc:
+            companion_svc = dev.get_service(Protocol.Companion)
+            mrp_svc = dev.get_service(Protocol.MRP)
+            if not airplay_svc and not raop_svc and not companion_svc and not mrp_svc:
                 continue
 
             model_str = str(getattr(dev.device_info, "raw_model", "") or getattr(dev.device_info, "model", "") or "AirPlay")
@@ -92,7 +95,7 @@ class AirPlayManager:
                 "model": model_str if model_str != "AirPlay" else ("AudioAccessory5,1" if is_homepod else "AirPlaySpeaker"),
                 "mac_address": mac,
                 "is_homepod": is_homepod,
-                "protocols": [p.name for p in [ s.protocol for s in dev.services ]],
+                "protocols": [p.name for p in [s.protocol for s in dev.services]],
             })
 
         return discovered
