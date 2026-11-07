@@ -1,0 +1,14 @@
+services:
+  podcast-bridge:
+    build: .
+    container_name: podcast-bridge
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - PODCAST_DATA_DIR=/data
+      - PODCAST_WEB_PORT=8788
+      # Optional for standalone mode connecting to Home Assistant:
+      # - HA_URL=http://homeassistant.local:8123
+      # - SUPERVISOR_TOKEN=your_long_lived_access_token
+    volumes:
+      - ./data:/data

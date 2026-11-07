@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PodCast Bridge — HomePod Mini to Chromecast Audio</title>
+  <meta name="description" content="Expose Apple HomePod Minis as native Google Cast (Chromecast Audio) receivers with AirPlay 2 and Home Assistant integration." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Hardware Studio Header -->
+    <header class="top-bar" role="banner">
+      <div class="brand-cluster">
+        <div class="hardware-led active" id="system-led" title="CastV2 &amp; mDNS Bridge Active"></div>
+        <div class="brand-titles">
+          <div class="brand-eyebrow">AIRPLAY RAOP &rarr; GOOGLE CASTV2 AUDIO BRIDGE</div>
+          <h1 class="brand-heading">PodCast Bridge</h1>
+        </div>
+      </div>
+
+      <div class="telemetry-strip" id="header-telemetry">
+        <div class="telemetry-pill" id="pill-host">
+          <span class="pill-label">HOST</span>
+          <span class="pill-value" id="val-host-ip">127.0.0.1</span>
+        </div>
+        <div class="telemetry-pill" id="pill-receivers">
+          <span class="pill-label">CAST RECEIVERS</span>
+          <span class="pill-value" id="val-active-receivers">0 Active</span>
+        </div>
+        <div class="telemetry-pill" id="pill-auth">
+          <span class="pill-label">CAST AUTH</span>
+          <span class="pill-value" id="val-auth-mode">SELF_SIGNED</span>
+        </div>
+        <div class="telemetry-pill" id="pill-ffmpeg">
+          <span class="pill-label">TRANSCODER</span>
+          <span class="pill-value" id="val-ffmpeg">FFmpeg Ready</span>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <button type="button" class="btn btn-secondary" id="btn-open-github-modal" title="Create and push repository to your GitHub account">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
+          <span>Publish to GitHub</span>
+        </button>
+        <a class="btn btn-secondary" href="./api/download/homepod-chromecast-bridge.tar.gz" download="homepod-chromecast-bridge.tar.gz" style="text-decoration:none;" title="Download full Home Assistant Add-on &amp; Docker repository archive">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          <span>Download Add-on (.tar.gz)</span>
+        </a>
+        <button type="button" class="btn btn-secondary" id="btn-preview-chime" title="Preview the built-in calibration chime in your browser">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+          <span>Audition Chime</span>
+        </button>
+        <button type="button" class="btn btn-secondary" id="btn-scan-network">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+          <span>Scan LAN &amp; HA</span>
+        </button>
+        <button type="button" class="btn btn-primary" id="btn-open-add-modal">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          <span>Add HomePod Mini</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Navigation Bar -->
+    <nav class="main-nav" aria-label="Primary Navigation">
+      <div class="nav-tabs" role="tablist">
+        <button type="button" role="tab" aria-selected="true" class="nav-tab active" data-tab="speakers" id="tab-btn-speakers">
+          <span>Bridged HomePod Minis</span>
+          <span class="tab-count" id="count-speakers">0</span>
+        </button>
+        <button type="button" role="tab" aria-selected="false" class="nav-tab" data-tab="inspector" id="tab-btn-inspector">
+          <span>CastV2 &amp; AirPlay Protocol Inspector</span>
+          <span class="tab-count" id="count-events">0</span>
+        </button>
+        <button type="button" role="tab" aria-selected="false" class="nav-tab" data-tab="settings" id="tab-btn-settings">
+          <span>Cast Auth, Home Assistant &amp; Audio</span>
+        </button>
+      </div>
+      <div class="ws-indicator">
+        <span class="ws-dot connected" id="ws-status-dot"></span>
+        <span class="ws-label" id="ws-status-text">Live Telemetry Connected</span>
+      </div>
+    </nav>
+
+    <!-- Toast / Diagnostic Banner -->
+    <div id="diagnostic-banner" class="diagnostic-banner hidden" role="status" aria-live="polite">
+      <div class="diagnostic-content">
+        <strong id="diag-title">CastV2 Session Verified</strong>
+        <p id="diag-message"></p>
+      </div>
+      <button type="button" class="btn-icon" id="btn-close-diag" aria-label="Close notification">&times;</button>
+    </div>
+
+    <!-- Main Content Area -->
+    <main class="main-content">
+      <!-- TAB 1: Bridged HomePod Minis -->
+      <section id="panel-speakers" class="tab-panel active" role="tabpanel" aria-labelledby="tab-btn-speakers">
+        <div class="section-intro">
+          <div>
+            <h2 class="section-title">Virtual Chromecast Audio Endpoints</h2>
+            <p class="section-subtitle">
+              Each HomePod Mini is advertised via mDNS (<code>_googlecast._tcp.local.</code>, model <code>Chromecast Audio</code>, capability <code>ca=199428</code>) with a hardware-signed <code>Eureka Gen1 ICA</code> CastV2 TLS listener (773 windows through Dec 2030) and Eureka/DIAL HTTP server.
+            </p>
+          </div>
+        </div>
+
+        <div class="diagnostic-banner" style="margin: 0 0 18px 0; border-color: var(--accent-amber);">
+          <div class="diagnostic-content">
+            <strong style="color: var(--accent-amber);">Why aren't speakers appearing in my phone/browser Cast menu yet? (Local Wi-Fi / LAN Required)</strong>
+            <p>
+              Google Cast discovery (<code>_googlecast._tcp.local.</code> on UDP <code>224.0.0.251:5353</code>) and Apple AirPlay (<code>_airplay._tcp.local.</code>) are <strong>link-local multicast protocols</strong> that cannot cross the internet from this remote preview container into your home Wi-Fi. To see your HomePod Minis inside YouTube Music, Spotify, Chrome, or Android apps on your phone, deploy this repository on your <strong>Home Assistant server</strong> (Add-on Store) or a machine on your home LAN with <code>--network host</code>.
+            </p>
+          </div>
+        </div>
+
+        <div id="devices-grid" class="devices-grid">
+          <!-- Populated dynamically by app.js -->
+        </div>
+      </section>
+
+      <!-- TAB 2: Live CastV2 & AirPlay Protocol Inspector -->
+      <section id="panel-inspector" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-btn-inspector">
+        <div class="inspector-header">
+          <div>
+            <h2 class="section-title">Real-Time Protocol Telemetry</h2>
+            <p class="section-subtitle">
+              Inspect binary <code>cast_channel.proto</code> frames (<code>DeviceAuthMessage</code>, <code>RECEIVER</code>, <code>MEDIA</code>) and outbound <code>pyatv</code> AirPlay / Home Assistant commands.
+            </p>
+          </div>
+          <div class="inspector-controls">
+            <div class="filter-group" role="group" aria-label="Filter protocol events">
+              <button type="button" class="filter-btn active" data-filter="all" id="filter-all">All</button>
+              <button type="button" class="filter-btn" data-filter="cast" id="filter-cast">CastV2 TLS</button>
+              <button type="button" class="filter-btn" data-filter="airplay" id="filter-airplay">AirPlay (pyatv)</button>
+              <button type="button" class="filter-btn" data-filter="ha" id="filter-ha">Home Assistant</button>
+            </div>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-clear-events">Clear Log</button>
+          </div>
+        </div>
+
+        <div class="terminal-window" id="protocol-log-container">
+          <table class="protocol-table" aria-label="Protocol Event Stream">
+            <thead>
+              <tr>
+                <th>TIME</th>
+                <th>SPEAKER</th>
+                <th>DIR</th>
+                <th>NAMESPACE / LAYER</th>
+                <th>SUMMARY &amp; PAYLOAD</th>
+              </tr>
+            </thead>
+            <tbody id="protocol-log-body">
+              <!-- Populated by app.js -->
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- TAB 3: Settings (Cast Auth, Home Assistant, Audio Transcoding) -->
+      <section id="panel-settings" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-btn-settings">
+        <div class="settings-grid">
+          <!-- Card 1: CastV2 Device Authentication -->
+          <article class="settings-card">
+            <div class="card-header">
+              <span class="card-kicker">SECURITY &amp; HANDSHAKE</span>
+              <h3>Google CastV2 Device Authentication</h3>
+            </div>
+            <p class="card-description">
+              Stock Android (Google Play Services) and Chrome connect to port <code>8009+</code> in the background and verify <code>DeviceAuthMessage</code> against Google's <code>Eureka Gen1 ICA</code> before showing a speaker in the Cast menu.
+            </p>
+
+            <div class="form-group">
+              <label for="select-auth-mode">Authentication Strategy</label>
+              <select id="select-auth-mode" class="form-control">
+                <option value="precomputed_bundle">Precomputed Eureka Gen1 ICA Hardware Bundle (773 Windows, 2026–2030 — Android / Chrome / YouTube Music)</option>
+                <option value="self_signed">Self-Signed Cast PKI (Works with Home Assistant, Music Assistant, pychromecast, DIAL)</option>
+              </select>
+            </div>
+
+            <div class="auth-bundle-box">
+              <div class="bundle-meta">
+                <div>
+                  <span class="meta-label">ACTIVE BUNDLE</span>
+                  <span class="meta-val" id="auth-bundle-name">eureka_gen1_ica_773_windows_2026_2030.json</span>
+                </div>
+                <div>
+                  <span class="meta-label">CERT WINDOWS</span>
+                  <span class="meta-val" id="auth-bundle-count">773</span>
+                </div>
+              </div>
+              <div class="bundle-actions">
+                <button type="button" class="btn btn-primary btn-sm" id="btn-load-eureka-bundle">
+                  Activate Eureka Gen1 ICA (773 Windows)
+                </button>
+                <label class="btn btn-secondary btn-sm" for="input-bundle-file">
+                  Upload Auth Bundle (.json)
+                </label>
+                <input type="file" id="input-bundle-file" accept=".json" class="hidden" />
+                <button type="button" class="btn btn-secondary btn-sm" id="btn-gen-sample-bundle">
+                  Generate Local Test Bundle
+                </button>
+              </div>
+            </div>
+          </article>
+
+          <!-- Card 2: Home Assistant Integration -->
+          <article class="settings-card">
+            <div class="card-header">
+              <span class="card-kicker">SMART HOME BRIDGE</span>
+              <h3>Home Assistant Integration</h3>
+            </div>
+            <p class="card-description">
+              When running as a Home Assistant Add-on, <code>SUPERVISOR_TOKEN</code> is detected automatically. For standalone Docker installs, provide your Home Assistant URL and Long-Lived Access Token.
+            </p>
+
+            <div class="form-group">
+              <label for="input-ha-url">Home Assistant Base URL</label>
+              <input type="url" id="input-ha-url" class="form-control" placeholder="http://homeassistant.local:8123" />
+            </div>
+
+            <div class="form-group">
+              <label for="input-ha-token">Long-Lived Access Token (leave blank to keep existing / Supervisor token)</label>
+              <input type="password" id="input-ha-token" class="form-control" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." />
+            </div>
+
+            <div class="ha-status-row">
+              <span class="status-badge" id="ha-conn-badge">Checking...</span>
+              <span class="mono-text" id="ha-entities-summary">0 media_player entities cached</span>
+            </div>
+          </article>
+
+          <!-- Card 3: Audio Transcoding & Network -->
+          <article class="settings-card">
+            <div class="card-header">
+              <span class="card-kicker">DSP &amp; NETWORK</span>
+              <h3>FFmpeg Audio Relay &amp; LAN Host</h3>
+            </div>
+            <p class="card-description">
+              Incoming Cast audio streams are transcoded on the fly to match HomePod Mini's native AirPlay / RAOP receiver format.
+            </p>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label for="input-host-ip">Advertised LAN IPv4 Address</label>
+                <input type="text" id="input-host-ip" class="form-control mono-input" placeholder="192.168.1.50" />
+              </div>
+              <div class="form-group">
+                <label for="select-audio-codec">AirPlay Relay Codec</label>
+                <select id="select-audio-codec" class="form-control">
+                  <option value="wav">WAV (Uncompressed 16-bit PCM — Lowest Latency)</option>
+                  <option value="mp3">MP3 (320 kbps CBR — Broad Compatibility)</option>
+                  <option value="aac">AAC (ADTS Stream)</option>
+                  <option value="flac">FLAC (Lossless Compressed)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label for="select-sample-rate">Sample Rate (Hz)</label>
+                <select id="select-sample-rate" class="form-control">
+                  <option value="44100">44,100 Hz (Native AirPlay RAOP)</option>
+                  <option value="48000">48,000 Hz (AirPlay 2 High-Res)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="select-bitrate">Bitrate</label>
+                <select id="select-bitrate" class="form-control">
+                  <option value="320k">320 kbps</option>
+                  <option value="256k">256 kbps</option>
+                  <option value="192k">192 kbps</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="card-footer-actions">
+              <button type="button" class="btn btn-primary" id="btn-save-settings">Save &amp; Apply Configuration</button>
+            </div>
+          </article>
+
+          <!-- Card 4: HomePod Mini Setup Guide -->
+          <article class="settings-card guide-card">
+            <div class="card-header">
+              <span class="card-kicker">HOMEPOD MINI CHECKLIST</span>
+              <h3>Apple HomeKit AirPlay Permissions</h3>
+            </div>
+            <ul class="checklist">
+              <li>
+                <strong>1. Allow Speaker &amp; TV Access:</strong> In the Apple <strong>Home</strong> app on iOS/macOS, open <em>Home Settings &rarr; Speakers &amp; TV</em> and set access to <strong>Everyone</strong> or <strong>Anyone on the Same Network</strong> with no password required.
+              </li>
+              <li>
+                <strong>2. Host Networking:</strong> When running in Docker or Home Assistant OS, keep <code>host_network: true</code> enabled so mDNS (UDP <code>5353</code>), CastV2 TLS (TCP <code>8009+</code>), and AirPlay RAOP traffic can traverse the local subnet.
+              </li>
+              <li>
+                <strong>3. Stereo Pairs:</strong> If two HomePod Minis are joined as a stereo pair in Apple Home, pair or target the primary channel's IP address—AirPlay routes stereo L/R balance automatically.
+              </li>
+            </ul>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- MODAL: Add HomePod Mini -->
+  <div class="modal-backdrop hidden" id="modal-add-device" role="dialog" aria-modal="true" aria-labelledby="modal-add-title">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <h3 id="modal-add-title">Add HomePod Mini to Cast Bridge</h3>
+        <button type="button" class="btn-icon" id="btn-close-add-modal" aria-label="Close modal">&times;</button>
+      </div>
+      <form id="form-add-device" class="modal-body">
+        <div class="form-row">
+          <div class="form-group">
+            <label for="add-name">HomePod Mini Name</label>
+            <input type="text" id="add-name" class="form-control" required placeholder="e.g. Office HomePod Mini" />
+          </div>
+          <div class="form-group">
+            <label for="add-cast-name">Advertised Chromecast Name</label>
+            <input type="text" id="add-cast-name" class="form-control" placeholder="e.g. Office HomePod Mini (Cast)" />
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="add-ip">HomePod IPv4 Address</label>
+            <input type="text" id="add-ip" class="form-control mono-input" required placeholder="192.168.1.150" />
+          </div>
+          <div class="form-group">
+            <label for="add-port">AirPlay Port</label>
+            <input type="number" id="add-port" class="form-control mono-input" value="7000" required />
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="add-transport">Audio Delivery Transport</label>
+            <select id="add-transport" class="form-control">
+              <option value="pyatv_stream">Direct AirPlay Stream (pyatv + FFmpeg)</option>
+              <option value="pyatv_url">Direct AirPlay URL Relay (pyatv play_url)</option>
+              <option value="ha_media_player">Home Assistant media_player Entity</option>
+              <option value="simulated">Simulated HomePod Sink (Testing / Diagnostics)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="add-ha-entity">Linked Home Assistant Entity (Optional)</label>
+            <input type="text" id="add-ha-entity" class="form-control mono-input" placeholder="media_player.office_homepod" />
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btn-cancel-add">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-add">Create Chromecast Audio Endpoint</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: Cast Custom Audio Stream -->
+  <div class="modal-backdrop hidden" id="modal-custom-cast" role="dialog" aria-modal="true" aria-labelledby="modal-cast-title">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <h3 id="modal-cast-title">Cast Audio Stream to HomePod Mini</h3>
+        <button type="button" class="btn-icon" id="btn-close-cast-modal" aria-label="Close modal">&times;</button>
+      </div>
+      <form id="form-custom-cast" class="modal-body">
+        <input type="hidden" id="cast-target-device-id" />
+        <p class="modal-hint">
+          Connects to the virtual Chromecast's TLS port using the built-in CastV2 sender, completes <code>DeviceAuthMessage</code>, launches <code>CC1AD845</code>, and sends a <code>LOAD</code> command.
+        </p>
+        <div class="form-group">
+          <label for="cast-stream-title">Track / Stream Title</label>
+          <input type="text" id="cast-stream-title" class="form-control" value="PodCast Bridge Acoustic Check" required />
+        </div>
+        <div class="form-group">
+          <label for="cast-stream-url">Audio Stream URL (HTTP/HTTPS WAV, MP3, AAC, Radio, or leave blank for built-in chime)</label>
+          <input type="text" id="cast-stream-url" class="form-control mono-input" placeholder="Leave blank for built-in 44.1kHz stereo chime" />
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btn-cancel-cast">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-cast">Send CastV2 LOAD Command</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: AirPlay PIN Pairing -->
+  <div class="modal-backdrop hidden" id="modal-pair-device" role="dialog" aria-modal="true" aria-labelledby="modal-pair-title">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <h3 id="modal-pair-title">Pair with HomePod Mini via AirPlay</h3>
+        <button type="button" class="btn-icon" id="btn-close-pair-modal" aria-label="Close modal">&times;</button>
+      </div>
+      <form id="form-pair-device" class="modal-body">
+        <input type="hidden" id="pair-target-device-id" />
+        <p class="modal-hint" id="pair-status-text">
+          Enter the 4-digit AirPlay pairing PIN announced by your HomePod Mini or shown in HomeKit.
+        </p>
+        <div class="form-group">
+          <label for="pair-pin-input">4-Digit AirPlay PIN</label>
+          <input type="text" id="pair-pin-input" class="form-control mono-input pin-input" maxlength="4" pattern="[0-9]{4}" placeholder="1234" required />
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btn-start-pair-req">Request New PIN on Speaker</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-pair">Complete Pairing</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: Publish to GitHub -->
+  <div class="modal-backdrop hidden" id="modal-github-publish" role="dialog" aria-modal="true" aria-labelledby="modal-gh-title">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <h3 id="modal-gh-title">Publish Add-on Repository to GitHub</h3>
+        <button type="button" class="btn-icon" id="btn-close-gh-modal" aria-label="Close modal">&times;</button>
+      </div>
+      <form id="form-github-publish" class="modal-body">
+        <p class="modal-hint" id="gh-publish-status">
+          Paste a temporary GitHub Personal Access Token (Classic with <code>repo</code> scope, or Fine-grained with <em>Administration: Read &amp; write</em> and <em>Contents: Read &amp; write</em>). Your token is used once in memory to create and push the repository and is never saved.
+        </p>
+        <div class="form-group">
+          <label for="gh-repo-name">Repository Name</label>
+          <input type="text" id="gh-repo-name" class="form-control mono-input" value="homepod-chromecast-bridge" required />
+        </div>
+        <div class="form-group">
+          <label for="gh-token-input">GitHub Personal Access Token (ghp_... or github_pat_...)</label>
+          <input type="password" id="gh-token-input" class="form-control mono-input" placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" required />
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btn-cancel-gh">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-gh">Create &amp; Push Repository</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <audio id="browser-audio-preview" class="hidden"></audio>
+  <script src="./app.js"></script>
+</body>
+</html>
