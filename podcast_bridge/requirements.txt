@@ -1,6 +1,7 @@
 fastapi>=0.110.0
 uvicorn>=0.29.0
 pyatv>=0.15.0
+srptools>=1.0.1,<2.0.0
 zeroconf>=0.132.0
 cryptography>=42.0.0
 httpx>=0.27.0

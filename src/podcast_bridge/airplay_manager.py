@@ -13,8 +13,11 @@ from typing import Any, Callable, Dict, List, Optional
 import pyatv
 from pyatv.const import Protocol
 
+from . import patch_srptools_compat
 from .audio_relay import AudioRelayManager
 from .models import HomePodDevice, PlayerState, TransportMode
+
+patch_srptools_compat()
 
 logger = logging.getLogger(__name__)
 

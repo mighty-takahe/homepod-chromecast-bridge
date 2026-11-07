@@ -93,7 +93,7 @@ def create_app(
 
     app = FastAPI(
         title="PodCast Bridge — HomePod Mini to Chromecast Audio",
-        version="0.4.0",
+        version="0.4.1",
         lifespan=lifespan,
     )
     app.state.bridge = manager
