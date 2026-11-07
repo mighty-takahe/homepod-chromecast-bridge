@@ -736,7 +736,8 @@ class VirtualChromecastAudio:
                 self.app_name = "Backdrop"
                 self.device.media.app_id = APP_BACKDROP
                 self.device.media.app_name = "Backdrop"
-                await self._on_stop(self.device)
+                self.device.player_state = PlayerState.IDLE
+                self.device.media.current_time = 0.0
                 reply = make_json_message(
                     "receiver-0",
                     msg.source_id,
@@ -746,12 +747,15 @@ class VirtualChromecastAudio:
                 await write_cast_message(writer, reply)
                 await self.broadcast_receiver_status(request_id=0, exclude=writer)
                 await self.broadcast_media_status(request_id=req_id)
+                asyncio.create_task(self._on_stop(self.device))
 
             elif msg_type == "SET_VOLUME":
                 vol_obj = data.get("volume", {})
-                new_level = vol_obj.get("level", self.device.volume)
+                new_level = float(vol_obj.get("level", self.device.volume))
                 new_muted = vol_obj.get("muted", self.device.muted)
-                await self._on_volume(self.device, float(new_level), new_muted)
+                self.device.volume = round(max(0.0, min(1.0, new_level)), 3)
+                if new_muted is not None:
+                    self.device.muted = bool(new_muted)
                 reply = make_json_message(
                     "receiver-0",
                     msg.source_id,
@@ -760,6 +764,7 @@ class VirtualChromecastAudio:
                 )
                 await write_cast_message(writer, reply)
                 await self.broadcast_receiver_status(request_id=0, exclude=writer)
+                asyncio.create_task(self._on_volume(self.device, self.device.volume, self.device.muted))
 
             return
 
@@ -849,7 +854,7 @@ class VirtualChromecastAudio:
                 self._emit("cast_out", ns, f"MEDIA_STATUS PLAYING '{meta.title}' -> HomePod '{self.device.name}'")
 
             elif msg_type == "PAUSE":
-                await self._on_pause(self.device)
+                self.device.player_state = PlayerState.PAUSED
                 reply = make_json_message(
                     self.transport_id,
                     msg.source_id,
@@ -858,9 +863,10 @@ class VirtualChromecastAudio:
                 )
                 await write_cast_message(writer, reply)
                 await self.broadcast_media_status(request_id=0, exclude=writer)
+                asyncio.create_task(self._on_pause(self.device))
 
             elif msg_type == "PLAY":
-                await self._on_resume(self.device)
+                self.device.player_state = PlayerState.PLAYING
                 reply = make_json_message(
                     self.transport_id,
                     msg.source_id,
@@ -869,9 +875,11 @@ class VirtualChromecastAudio:
                 )
                 await write_cast_message(writer, reply)
                 await self.broadcast_media_status(request_id=0, exclude=writer)
+                asyncio.create_task(self._on_resume(self.device))
 
             elif msg_type == "STOP":
-                await self._on_stop(self.device)
+                self.device.player_state = PlayerState.IDLE
+                self.device.media.current_time = 0.0
                 reply = make_json_message(
                     self.transport_id,
                     msg.source_id,
@@ -880,10 +888,11 @@ class VirtualChromecastAudio:
                 )
                 await write_cast_message(writer, reply)
                 await self.broadcast_media_status(request_id=0, exclude=writer)
+                asyncio.create_task(self._on_stop(self.device))
 
             elif msg_type == "SEEK":
                 pos = float(data.get("currentTime", 0.0))
-                await self._on_seek(self.device, pos)
+                self.device.media.current_time = pos
                 reply = make_json_message(
                     self.transport_id,
                     msg.source_id,
@@ -892,12 +901,15 @@ class VirtualChromecastAudio:
                 )
                 await write_cast_message(writer, reply)
                 await self.broadcast_media_status(request_id=0, exclude=writer)
+                asyncio.create_task(self._on_seek(self.device, pos))
 
             elif msg_type == "SET_VOLUME":
                 vol_obj = data.get("volume", {})
-                new_level = vol_obj.get("level", self.device.volume)
+                new_level = float(vol_obj.get("level", self.device.volume))
                 new_muted = vol_obj.get("muted", self.device.muted)
-                await self._on_volume(self.device, float(new_level), new_muted)
+                self.device.volume = round(max(0.0, min(1.0, new_level)), 3)
+                if new_muted is not None:
+                    self.device.muted = bool(new_muted)
                 reply = make_json_message(
                     self.transport_id,
                     msg.source_id,
@@ -906,6 +918,7 @@ class VirtualChromecastAudio:
                 )
                 await write_cast_message(writer, reply)
                 await self.broadcast_media_status(request_id=0, exclude=writer)
+                asyncio.create_task(self._on_volume(self.device, self.device.volume, self.device.muted))
 
             elif msg_type in ("QUEUE_NEXT", "QUEUE_PREV", "QUEUE_UPDATE") and self.queue_items:
                 if msg_type == "QUEUE_UPDATE":

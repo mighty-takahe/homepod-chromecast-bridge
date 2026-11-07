@@ -149,7 +149,12 @@ class AudioRelayManager:
 
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
         if self.config.low_latency:
-            cmd.extend(["-fflags", "nobuffer", "-flags", "low_delay"])
+            cmd.extend([
+                "-fflags", "+nobuffer+fastseek",
+                "-flags", "low_delay",
+                "-probesize", "65536",
+                "-analyzeduration", "100000",
+            ])
         if start_time > 0:
             cmd.extend(["-ss", f"{start_time:.2f}"])
         cmd.extend([
@@ -157,6 +162,7 @@ class AudioRelayManager:
             "-vn",
             "-ar", str(self.config.sample_rate),
             "-ac", str(self.config.channels),
+            "-flush_packets", "1",
             *fmt_args,
             "pipe:1",
         ])
@@ -170,7 +176,7 @@ class AudioRelayManager:
         try:
             assert proc.stdout is not None
             while True:
-                chunk = await proc.stdout.read(16384)
+                chunk = await proc.stdout.read(4096)
                 if not chunk:
                     break
                 yield chunk

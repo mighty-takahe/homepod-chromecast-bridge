@@ -93,7 +93,7 @@ def create_app(
 
     app = FastAPI(
         title="PodCast Bridge — HomePod Mini to Chromecast Audio",
-        version="0.4.1",
+        version="0.4.2",
         lifespan=lifespan,
     )
     app.state.bridge = manager
@@ -298,9 +298,18 @@ def create_app(
             "flac": "audio/flac",
         }
         mime = media_types.get(ext.lower(), "audio/wav")
+        stream_headers = {
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+            "Accept-Ranges": "none",
+        }
         return StreamingResponse(
             manager.relay_manager.stream_transcoded(device_id, codec=ext.lower()),
             media_type=mime,
+            headers=stream_headers,
         )
 
     @app.get("/api/download/homepod-chromecast-bridge.tar.gz")
