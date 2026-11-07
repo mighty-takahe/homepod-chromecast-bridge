@@ -100,7 +100,7 @@ async def send_test_cast_session(
         if pong and pong.namespace == NS_HEARTBEAT:
             steps.append("Heartbeat PING -> PONG verified")
 
-        # 3b. Receiver Discovery GET_DEVICE_INFO check (Android Play Services / Chrome)
+        # 3b. Receiver Discovery GET_DEVICE_INFO & Setup eureka_info checks (Android Play Services / Chrome)
         await write_cast_message(
             writer,
             make_json_message("sender-test", "receiver-0", NS_DISCOVERY, {"requestId": 9, "type": "GET_DEVICE_INFO"}),
@@ -109,7 +109,7 @@ async def send_test_cast_session(
         if disc_reply and disc_reply.namespace == NS_DISCOVERY:
             disc_payload = disc_reply.json_payload()
             caps = disc_payload.get("deviceCapabilities")
-            steps.append(f"Discovery DEVICE_INFO verified (ca={caps})")
+            steps.append(f"Discovery DEVICE_INFO verified (ca={caps}, id={disc_payload.get('deviceId')})")
 
         # 4. Optional volume set
         if volume is not None:
@@ -177,17 +177,19 @@ async def send_test_cast_session(
         )
 
         media_state = "UNKNOWN"
-        for _ in range(5):
+        for _ in range(6):
             msg = await asyncio.wait_for(read_cast_message(reader), timeout=4.0)
             if not msg:
                 break
             payload = msg.json_payload()
             if payload.get("type") == "MEDIA_STATUS":
                 st_list = payload.get("status", [])
-                if st_list:
+                if st_list and int(payload.get("requestId", 0)) == 2:
                     media_state = st_list[0].get("playerState", "PLAYING")
                     steps.append(f"MEDIA_STATUS confirmed: {media_state} ('{title}')")
                     break
+                elif st_list:
+                    media_state = st_list[0].get("playerState", "PLAYING")
 
         elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
         return {

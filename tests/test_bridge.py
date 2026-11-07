@@ -149,6 +149,24 @@ async def test_e2e_virtual_chromecast_and_api(tmp_path: Path):
                 eureka_json = eureka_resp.json()
                 assert eureka_json["device_info"]["model_name"] == "Chromecast Audio"
                 assert eureka_json["device_info"]["capabilities"]["display_supported"] is False
+                assert eureka_json["setup_state"] == 60
+                assert eureka_json["tos_accepted"] is True
+                assert len(eureka_json["public_key"]) > 40
+
+                # Verify ?params= filtering used by Android Play Services / Chrome
+                filtered_resp = await lan_client.get(
+                    f"http://127.0.0.1:{eureka_port}/setup/eureka_info?params=version,name,device_info"
+                )
+                assert filtered_resp.status_code == 200
+                filtered_json = filtered_resp.json()
+                assert set(filtered_json.keys()) == {"version", "name", "device_info"}
+
+                # Verify mDNS TXT 'cd' matches active TLS peer certificate MD5 digest
+                receiver_obj = manager.receivers[dev_id]
+                txt_dict = receiver_obj._build_txt_dict()
+                assert txt_dict["cd"] == manager.auth_manager.get_active_peer_cert_md5_hex()
+                assert len(txt_dict["id"]) == 32 and "-" not in txt_dict["id"]
+                assert len(txt_dict["bs"]) == 12
 
                 dial_resp = await lan_client.get(f"http://127.0.0.1:{eureka_port}/ssdp/device-desc.xml")
                 assert dial_resp.status_code == 200

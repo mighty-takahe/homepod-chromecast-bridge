@@ -32,20 +32,32 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 
-def detect_local_ip() -> str:
-    """Detect primary LAN IPv4 address."""
-    env_ip = os.environ.get("BRIDGE_HOST_IP")
-    if env_ip:
-        return env_ip
+SEEDED_DEMO_IPS = frozenset({"192.168.1.142", "192.168.1.143"})
+
+
+def detect_local_ip_for_target(target_ip: str = "192.168.1.1") -> str:
+    """Detect the local LAN IPv4 address used to route to target_ip."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("10.255.255.255", 1))
+        s.connect((target_ip, 7000))
         ip = s.getsockname()[0]
     except Exception:
         ip = "127.0.0.1"
     finally:
         s.close()
     return ip
+
+
+def detect_local_ip() -> str:
+    """Detect primary physical LAN IPv4 address (avoiding Docker hassio/docker0 bridge IPs when possible)."""
+    env_ip = os.environ.get("BRIDGE_HOST_IP")
+    if env_ip:
+        return env_ip
+    for probe in ("192.168.1.1", "10.0.0.1", "8.8.8.8", "10.255.255.255"):
+        ip = detect_local_ip_for_target(probe)
+        if ip and not ip.startswith(("127.", "172.17.", "172.30.", "0.")):
+            return ip
+    return detect_local_ip_for_target("10.255.255.255")
 
 
 class BridgeManager:
@@ -73,7 +85,7 @@ class BridgeManager:
         self._ws_Queues: Set[asyncio.Queue] = set()
 
         self._load_state()
-        if not self.settings.host_ip:
+        if not self.settings.host_ip or self.settings.host_ip.startswith(("127.", "172.17.", "172.30.", "0.")):
             self.settings.host_ip = detect_local_ip()
 
         self.auth_manager = CastAuthManager(self.data_dir, self.settings.auth)
@@ -161,23 +173,82 @@ class BridgeManager:
             e_port += 1
         return c_port, e_port
 
+    def _has_real_devices(self) -> bool:
+        return any(
+            d.transport_mode != TransportMode.SIMULATED or d.ip_address not in SEEDED_DEMO_IPS
+            for d in self.devices.values()
+        )
+
+    def _sync_host_ip_from_real_devices(self) -> bool:
+        """Update self.settings.host_ip to the exact LAN interface IP that routes to discovered HomePods."""
+        if os.environ.get("BRIDGE_HOST_IP"):
+            return False
+        for dev in self.devices.values():
+            if dev.transport_mode != TransportMode.SIMULATED and dev.ip_address not in SEEDED_DEMO_IPS:
+                candidate = detect_local_ip_for_target(dev.ip_address)
+                if candidate and not candidate.startswith(("127.", "0.")):
+                    if candidate != self.settings.host_ip:
+                        logger.info("Updated bridge host_ip %s -> %s (via HomePod %s)", self.settings.host_ip, candidate, dev.ip_address)
+                        self.settings.host_ip = candidate
+                        return True
+                    return False
+        return False
+
+    async def _purge_seeded_simulated_if_real_present(self) -> bool:
+        """Remove the 2 default seeded demo devices once real HomePod Minis are present and compact ports to 8009+."""
+        real_devs = [
+            d for d in self.devices.values()
+            if d.transport_mode != TransportMode.SIMULATED
+        ]
+        if not real_devs:
+            return False
+
+        seeded_ids = [
+            did for did, d in self.devices.items()
+            if d.transport_mode == TransportMode.SIMULATED and d.ip_address in SEEDED_DEMO_IPS
+        ]
+        changed = False
+        for did in seeded_ids:
+            await self.stop_receiver(did)
+            self.devices.pop(did, None)
+            self._broadcast_ws({"type": "device_deleted", "device_id": did})
+            changed = True
+
+        # Compact ports starting at base_cast_port (8009) if any real device was pushed to 8011+ by seeded demos
+        used_ports = [d.cast_port for d in self.devices.values()]
+        if self.settings.base_cast_port not in used_ports and self.devices:
+            for idx, dev in enumerate(self.devices.values()):
+                new_c = self.settings.base_cast_port + idx
+                new_e = self.settings.base_eureka_port + idx
+                if dev.cast_port != new_c or dev.eureka_port != new_e:
+                    await self.stop_receiver(dev.id)
+                    dev.cast_port = new_c
+                    dev.eureka_port = new_e
+                    changed = True
+
+        return changed
+
     async def start(self, seed_default_if_empty: bool = True) -> None:
         """Start the bridge manager, discover HomePods, and launch virtual Chromecast Audio servers."""
         await self.ha_client.check_connection()
 
-        if not self.devices and seed_default_if_empty:
-            # Perform a fast network scan first
-            scanned = await self.airplay_manager.scan_network(timeout=2)
+        if (not self.devices or not self._has_real_devices()) and seed_default_if_empty and self.settings.mdns_enabled:
+            # Perform a network scan on startup so real HomePod Minis replace any seeded demo devices
+            scanned = await self.airplay_manager.scan_network(timeout=3)
             for item in scanned:
-                await self.register_device(
-                    name=item["name"],
-                    ip_address=item["ip_address"],
-                    airplay_port=item["airplay_port"],
-                    model=item["model"],
-                    mac_address=item["mac_address"],
-                    transport_mode=TransportMode.PYATV_STREAM,
-                    start_immediately=False,
-                )
+                if item.get("is_homepod", True):
+                    await self.register_device(
+                        name=item["name"],
+                        ip_address=item["ip_address"],
+                        airplay_port=item["airplay_port"],
+                        model=item["model"],
+                        mac_address=item["mac_address"],
+                        transport_mode=TransportMode.PYATV_STREAM,
+                        start_immediately=False,
+                    )
+
+        await self._purge_seeded_simulated_if_real_present()
+        self._sync_host_ip_from_real_devices()
 
         if not self.devices and seed_default_if_empty:
             # Seed two realistic HomePod Mini endpoints so the bridge is immediately usable & testable
@@ -446,12 +517,13 @@ class BridgeManager:
 
     async def scan_all(self) -> Dict[str, Any]:
         """Scan LAN via pyatv (AirPlay/RAOP) and query Home Assistant media_player entities."""
-        airplay_found = await self.airplay_manager.scan_network(timeout=3)
+        airplay_found = await self.airplay_manager.scan_network(timeout=4)
         ha_players = await self.ha_client.discover_media_players()
 
+        has_explicit_homepod = any(item.get("is_homepod") for item in airplay_found)
         newly_added: List[str] = []
         for item in airplay_found:
-            if item["is_homepod"]:
+            if item.get("is_homepod") or not has_explicit_homepod:
                 dev = await self.register_device(
                     name=item["name"],
                     ip_address=item["ip_address"],
@@ -459,18 +531,26 @@ class BridgeManager:
                     model=item["model"],
                     mac_address=item["mac_address"],
                     transport_mode=TransportMode.PYATV_STREAM,
+                    start_immediately=False,
                 )
                 newly_added.append(dev.id)
+
+        purged = await self._purge_seeded_simulated_if_real_present()
+        ip_changed = self._sync_host_ip_from_real_devices()
+        if newly_added or purged or ip_changed:
+            self.save_state()
+            await self.restart_all_receivers()
 
         return {
             "airplay_discovered": airplay_found,
             "ha_entities": ha_players,
             "auto_registered_ids": newly_added,
+            "host_ip": self.settings.host_ip,
         }
 
     def get_status_summary(self) -> Dict[str, Any]:
         return {
-            "version": "0.2.0",
+            "version": "0.3.0",
             "host_ip": self.settings.host_ip,
             "web_port": self.web_port,
             "ffmpeg_available": has_ffmpeg(),

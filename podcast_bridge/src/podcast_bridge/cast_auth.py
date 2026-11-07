@@ -225,8 +225,10 @@ class CastAuthManager:
         if bundle_path.exists():
             try:
                 raw = json.loads(bundle_path.read_text(encoding="utf-8"))
-                self._parse_and_activate_bundle(raw, name=raw.get("name", "auth_bundle.json"), persist=False)
-                return
+                bundle_name = raw.get("name", "auth_bundle.json")
+                if bundle_name != "local_precomputed_window_bundle.json":
+                    self._parse_and_activate_bundle(raw, name=bundle_name, persist=False)
+                    return
             except Exception as exc:
                 logger.warning("Failed to parse auth_bundle.json: %s", exc)
 
@@ -297,6 +299,7 @@ class CastAuthManager:
         if not parsed:
             raise ValueError("No valid certificate windows found in bundle")
 
+        parsed.sort(key=lambda w: w.not_before)
         self.windows = parsed
         if persist:
             bundle_path = self.certs_dir / "auth_bundle.json"
@@ -428,6 +431,26 @@ class CastAuthManager:
                 return cert.public_bytes(serialization.Encoding.DER)
         assert self._peer_cert is not None
         return self._peer_cert.public_bytes(serialization.Encoding.DER)
+
+    def get_active_peer_cert_md5_hex(self) -> str:
+        """Return uppercase 32-char MD5 hex digest of the active TLS peer certificate DER (for mDNS 'cd')."""
+        return hashlib.md5(self.get_active_peer_cert_der()).hexdigest().upper()
+
+    def get_active_device_public_key_b64(self) -> str:
+        """Return Base64-encoded SubjectPublicKeyInfo DER of the device auth certificate (for eureka 'public_key')."""
+        cert: Optional[x509.Certificate] = None
+        if self.config.mode == CastAuthMode.PRECOMPUTED_BUNDLE:
+            win = self._get_active_window()
+            if win and win.device_cert_pem:
+                cert = x509.load_pem_x509_certificate(win.device_cert_pem.encode("utf-8"))
+        if cert is None:
+            cert = self._device_cert
+        assert cert is not None
+        spki_der = cert.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return base64.b64encode(spki_der).decode("ascii")
 
     def handle_auth_challenge(self, raw_challenge_bytes: bytes) -> bytes:
         """Process incoming DeviceAuthMessage binary payload and return serialized DeviceAuthMessage response."""

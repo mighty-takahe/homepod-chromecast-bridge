@@ -317,66 +317,87 @@ def create_app(
 
     @app.post("/api/github/publish")
     async def publish_to_github(req: GitHubPublishRequest) -> Dict[str, Any]:
-        """Create and push the Home Assistant Add-on repository to GitHub using a 1-time token."""
-        import json as _json
+        """Create and push the Home Assistant Add-on repository to GitHub using the Git Data REST API."""
+        import base64 as _b64
+        import subprocess as _sp
 
         token = req.token.strip()
         if not token:
             raise HTTPException(status_code=400, detail="GitHub Personal Access Token is required")
         repo_name = req.repo_name.strip() or "homepod-chromecast-bridge"
-
-        # 1. Verify token and fetch GitHub username
-        user_proc = await asyncio.create_subprocess_exec(
-            "curl", "-sS",
-            "-H", f"Authorization: Bearer {token}",
-            "-H", "Accept: application/vnd.github+json",
-            "https://api.github.com/user",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        user_out, _ = await user_proc.communicate()
-        try:
-            user_data = _json.loads(user_out.decode("utf-8", errors="replace"))
-        except Exception:
-            raise HTTPException(status_code=400, detail="Failed to reach GitHub API")
-        owner = user_data.get("login")
-        if not owner:
-            raise HTTPException(status_code=401, detail=user_data.get("message", "Invalid GitHub token"))
-
-        # 2. Create repository (ignore 422 if it already exists)
-        create_payload = _json.dumps({
-            "name": repo_name,
-            "description": "Home Assistant Add-on & Docker bridge that exposes Apple HomePod Minis as Google Cast (Chromecast Audio) devices",
-            "private": bool(req.private),
-            "auto_init": False,
-        })
-        create_proc = await asyncio.create_subprocess_exec(
-            "curl", "-sS", "-X", "POST",
-            "-H", f"Authorization: Bearer {token}",
-            "-H", "Accept: application/vnd.github+json",
-            "-d", create_payload,
-            "https://api.github.com/user/repos",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await create_proc.communicate()
-
-        # 3. Push main branch without persisting token in .git/config
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
         repo_root = Path(__file__).resolve().parents[2]
-        remote_url = f"https://x-access-token:{token}@github.com/{owner}/{repo_name}.git"
-        push_proc = await asyncio.create_subprocess_exec(
-            "git", "-c", "credential.helper=", "push", "--force", remote_url, "HEAD:refs/heads/main",
-            cwd=str(repo_root),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, push_err = await push_proc.communicate()
-        if push_proc.returncode != 0:
-            err_msg = push_err.decode("utf-8", errors="replace").replace(token, "***")
-            raise HTTPException(status_code=400, detail=f"git push failed: {err_msg}")
+
+        import os as _os
+        _os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+        _os.environ["no_proxy"] = "localhost,127.0.0.1"
+
+        async with httpx.AsyncClient(base_url="https://api.github.com", headers=headers, timeout=60.0, trust_env=True) as client:
+            u_resp = await client.get("/user")
+            if u_resp.status_code != 200:
+                raise HTTPException(status_code=u_resp.status_code, detail="Invalid or expired GitHub token")
+            owner = u_resp.json().get("login")
+
+            await client.post(
+                "/user/repos",
+                json={
+                    "name": repo_name,
+                    "description": "Home Assistant Add-on & Docker bridge that exposes Apple HomePod Minis as Google Cast (Chromecast Audio) devices",
+                    "private": bool(req.private),
+                    "auto_init": True,
+                },
+            )
+
+            ref_resp = await client.get(f"/repos/{owner}/{repo_name}/git/ref/heads/main")
+            parent_sha = ref_resp.json()["object"]["sha"] if ref_resp.status_code == 200 else None
+
+            files = _sp.check_output(["git", "ls-files"], cwd=str(repo_root)).decode().splitlines()
+            addon_files = [
+                "config.yaml", "Dockerfile", "run.sh", "requirements.txt", "pyproject.toml", "README.md"
+            ] + [f for f in files if f.startswith("src/")]
+
+            tree_items = []
+            blob_cache: Dict[str, str] = {}
+            for rel_path in files:
+                raw = (repo_root / rel_path).read_bytes()
+                b64 = _b64.b64encode(raw).decode("ascii")
+                b_resp = await client.post(f"/repos/{owner}/{repo_name}/git/blobs", json={"content": b64, "encoding": "base64"})
+                b_resp.raise_for_status()
+                sha = b_resp.json()["sha"]
+                blob_cache[rel_path] = sha
+                mode = "100755" if rel_path.endswith(".sh") else "100644"
+                tree_items.append({"path": rel_path, "mode": mode, "type": "blob", "sha": sha})
+
+            for rel_path in addon_files:
+                if rel_path in blob_cache:
+                    mode = "100755" if rel_path.endswith(".sh") else "100644"
+                    tree_items.append({"path": f"podcast_bridge/{rel_path}", "mode": mode, "type": "blob", "sha": blob_cache[rel_path]})
+
+            t_resp = await client.post(f"/repos/{owner}/{repo_name}/git/trees", json={"tree": tree_items})
+            t_resp.raise_for_status()
+            tree_sha = t_resp.json()["sha"]
+
+            commit_payload: Dict[str, Any] = {
+                "message": "v0.3.0: Fix mDNS cd cert digest, RawMdnsAdvertiser, Eureka :8008/:8443, and NS_SETUP/NS_DISCOVERY wire payloads",
+                "tree": tree_sha,
+            }
+            if parent_sha:
+                commit_payload["parents"] = [parent_sha]
+            c_resp = await client.post(f"/repos/{owner}/{repo_name}/git/commits", json=commit_payload)
+            c_resp.raise_for_status()
+            commit_sha = c_resp.json()["sha"]
+
+            if parent_sha:
+                await client.patch(f"/repos/{owner}/{repo_name}/git/refs/heads/main", json={"sha": commit_sha, "force": True})
+            else:
+                await client.post(f"/repos/{owner}/{repo_name}/git/refs", json={"ref": "refs/heads/main", "sha": commit_sha})
 
         html_url = f"https://github.com/{owner}/{repo_name}"
-        return {"ok": True, "owner": owner, "repo": repo_name, "url": html_url}
+        return {"ok": True, "owner": owner, "repo": repo_name, "url": html_url, "commit": commit_sha}
 
     # --- Real-time WebSocket Telemetry ---
 
