@@ -237,9 +237,9 @@ class BridgeManager:
         for s_dev in seeded_devs:
             s_name = s_dev.name.lower()
             should_purge = False
-            if "living" in s_name and (has_real_living or len(real_devs) >= 2):
+            if "living" in s_name and has_real_living:
                 should_purge = True
-            elif "kitchen" in s_name and (has_real_kitchen or len(real_devs) >= 2):
+            elif "kitchen" in s_name and has_real_kitchen:
                 should_purge = True
 
             if should_purge:
@@ -406,6 +406,19 @@ class BridgeManager:
                     start_immediately=False,
                 )
 
+        # Guarantee all devices are enabled and have non-colliding ports
+        used_cast: Set[int] = set()
+        used_eureka: Set[int] = set()
+        for dev in self.devices.values():
+            if not dev.enabled:
+                dev.enabled = True
+            while dev.cast_port in used_cast:
+                dev.cast_port += 1
+            used_cast.add(dev.cast_port)
+            while dev.eureka_port in used_eureka:
+                dev.eureka_port += 1
+            used_eureka.add(dev.eureka_port)
+
         for dev in list(self.devices.values()):
             if dev.enabled:
                 await self.start_receiver(dev.id)
@@ -547,6 +560,7 @@ class BridgeManager:
             on_event=self._record_event,
             on_state_change=self._on_device_state_change,
             mdns_enabled=False,
+            receivers_provider=lambda: list(self.receivers.values()),
         )
         await receiver.start()
         self.receivers[device_id] = receiver
@@ -785,7 +799,7 @@ class BridgeManager:
 
     def get_status_summary(self) -> Dict[str, Any]:
         return {
-            "version": "0.4.6",
+            "version": "0.4.7",
             "host_ip": self.settings.host_ip,
             "web_port": self.web_port,
             "ffmpeg_available": has_ffmpeg(),

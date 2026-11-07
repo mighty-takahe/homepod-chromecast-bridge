@@ -549,7 +549,20 @@ async def test_unified_multi_device_mdns(tmp_path: Path):
     assert 8009 in srv_ports
     assert 8010 in srv_ports
 
-    # 2. Verify goodbye packet has ttl=0
+    # 2. Verify announcement packet places all records in Answer section per RFC 6762 8.3
+    ann_pkt = build_multi_mdns_packet(receivers_list, ip_address="192.168.1.50", ttl=120, query_type="announcement")
+    ann_inc = zeroconf.DNSIncoming(ann_pkt)
+    assert ann_inc.valid is True
+    assert ann_inc.num_answers >= 4 * len(receivers_list)
+    assert ann_inc.num_additionals == 0
+
+    # 3. Verify host_a query places host A record in Answer section
+    host_pkt = build_multi_mdns_packet(receivers_list, ip_address="192.168.1.50", ttl=120, query_type="host_a")
+    host_inc = zeroconf.DNSIncoming(host_pkt)
+    assert host_inc.valid is True
+    assert host_inc.num_answers >= len(receivers_list)
+
+    # 4. Verify goodbye packet has ttl=0
     goodbye_pkt = build_receiver_goodbye_packet(receivers_list[0], ip_address="192.168.1.50")
     gb_incoming = zeroconf.DNSIncoming(goodbye_pkt)
     assert gb_incoming.valid is True
@@ -557,4 +570,61 @@ async def test_unified_multi_device_mdns(tmp_path: Path):
     assert gb_incoming.answers()[0].ttl == 0
 
     await mgr.stop()
+
+
+@pytest.mark.asyncio
+async def test_state_auto_healing_missing_kitchen(tmp_path: Path):
+    """Verify that if bridge_state.json is missing Kitchen or disabled, start() automatically heals state."""
+    import json
+    from podcast_bridge.bridge_manager import BridgeManager
+    from podcast_bridge.models import TransportMode
+
+    state_file = tmp_path / "bridge_state.json"
+    # Write a degraded state file containing ONLY Living Room (simulating v0.4.4 purge bug)
+    degraded = {
+        "settings": {
+            "host_ip": "192.168.1.50",
+            "mdns_enabled": False,
+        },
+        "devices": [
+            {
+                "id": "homepod_living",
+                "name": "Living Room HomePod Mini",
+                "cast_name": "Living Room HomePod Mini (Cast)",
+                "ip_address": "192.168.1.142",
+                "cast_port": 8009,
+                "eureka_port": 18008,
+                "transport_mode": "pyatv_stream",
+                "ha_entity_id": "media_player.living_room_homepod_mini",
+                "enabled": True,
+            }
+        ],
+    }
+    state_file.write_text(json.dumps(degraded, indent=2))
+
+    mgr = BridgeManager(data_dir=tmp_path, web_port=18792, mdns_enabled=False)
+    # Start bridge: should auto-heal and restore Kitchen HomePod Mini
+    await mgr.start(seed_default_if_empty=True)
+
+    # Both Living Room and Kitchen must be present, enabled, and have distinct ports
+    names = [d.name.lower() for d in mgr.devices.values()]
+    assert any("living" in n for n in names)
+    assert any("kitchen" in n for n in names)
+    assert len(mgr.receivers) >= 2
+
+    kitchen_dev = next(d for d in mgr.devices.values() if "kitchen" in d.name.lower())
+    living_dev = next(d for d in mgr.devices.values() if "living" in d.name.lower())
+
+    assert kitchen_dev.enabled is True
+    assert living_dev.enabled is True
+    assert kitchen_dev.cast_port != living_dev.cast_port
+    assert kitchen_dev.eureka_port != living_dev.eureka_port
+
+    # Verify state was saved to disk with both devices
+    saved = json.loads(state_file.read_text())
+    saved_names = [d["name"].lower() for d in saved["devices"]]
+    assert any("kitchen" in n for n in saved_names)
+
+    await mgr.stop()
+
 

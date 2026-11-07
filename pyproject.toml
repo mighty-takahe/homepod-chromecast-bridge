@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "podcast-bridge"
-version = "0.4.6"
+version = "0.4.7"
 description = "Exposes Apple HomePod Minis as Google Cast (Chromecast Audio) devices with AirPlay 2 and Home Assistant integration"
 readme = "README.md"
 requires-python = ">=3.11"

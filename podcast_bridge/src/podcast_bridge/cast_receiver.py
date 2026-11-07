@@ -135,11 +135,16 @@ def build_multi_mdns_packet(
     receivers: List[VirtualChromecastAudio],
     ip_address: str,
     ttl: int = 120,
+    query_type: str = "ptr",
 ) -> bytes:
     """Build a complete RFC 6762 mDNS response packet containing all active Cast receivers.
 
-    Answers (ANCOUNT): PTR records for each receiver (_googlecast._tcp.local. -> instance_fqdn).
-    Additionals (ARCOUNT): SRV, TXT, and A records for each receiver.
+    Supports:
+    - query_type='ptr': PTR in Answer section, SRV, TXT, and A in Additional section.
+    - query_type='host_a': Host A records in Answer section, PTR, SRV, and TXT in Additional section.
+    - query_type='srv': SRV records in Answer section, TXT, A, and PTR in Additional section.
+    - query_type='txt': TXT records in Answer section, SRV, A, and PTR in Additional section.
+    - query_type='announcement': All records in Answer section per RFC 6762 8.3 for unsolicited announcements.
     """
     if not receivers:
         return struct.pack(">HHHHHH", 0, 0x8400, 0, 0, 0, 0)
@@ -147,6 +152,8 @@ def build_multi_mdns_packet(
     service_fqdn = f"{GOOGLECAST_SERVICE}."
     answers = bytearray()
     additionals = bytearray()
+    num_answers = 0
+    num_additionals = 0
     seen_hosts: Set[str] = set()
 
     for r in receivers:
@@ -155,66 +162,117 @@ def build_multi_mdns_packet(
         host_fqdn = f"{r.hyphenated_uuid}.local."
         txt = r.build_txt_dict() if hasattr(r, "build_txt_dict") else r._build_txt_dict()
         port = r.device.cast_port
-
-        # PTR in Answer section (class 0x0001 IN, shared record without cache-flush bit)
-        answers.extend(
-            _encode_dns_record(
-                service_fqdn, 12, 0x0001, 4500 if ttl > 0 else 0, _encode_dns_name(instance_fqdn)
-            )
-        )
-
-        # SRV in Additional section (class 0x8001 IN with cache-flush bit)
-        srv_rdata = struct.pack(">HHH", 0, 0, port) + _encode_dns_name(host_fqdn)
-        additionals.extend(
-            _encode_dns_record(instance_fqdn, 33, 0x8001, ttl, srv_rdata)
-        )
-
-        # TXT in Additional section (class 0x8001 IN with cache-flush bit)
-        additionals.extend(
-            _encode_dns_record(instance_fqdn, 16, 0x8001, 4500 if ttl > 0 else 0, _encode_txt_rdata(txt))
-        )
-
-        # A in Additional section (class 0x8001 IN with cache-flush bit)
         adv_ip = r.host_ip if (r.host_ip and r.host_ip not in ("0.0.0.0", "")) else ip_address
-        if adv_ip and adv_ip not in ("0.0.0.0", "") and host_fqdn not in seen_hosts:
-            seen_hosts.add(host_fqdn)
-            additionals.extend(
-                _encode_dns_record(host_fqdn, 1, 0x8001, ttl, ipaddress.IPv4Address(adv_ip).packed)
-            )
 
-    num_answers = len(receivers)
-    num_additionals = 2 * len(receivers) + len(seen_hosts)
+        ptr_rec = _encode_dns_record(
+            service_fqdn, 12, 0x0001, 4500 if ttl > 0 else 0, _encode_dns_name(instance_fqdn)
+        )
+        srv_rdata = struct.pack(">HHH", 0, 0, port) + _encode_dns_name(host_fqdn)
+        srv_rec = _encode_dns_record(instance_fqdn, 33, 0x8001, ttl, srv_rdata)
+        txt_rec = _encode_dns_record(instance_fqdn, 16, 0x8001, 4500 if ttl > 0 else 0, _encode_txt_rdata(txt))
+        a_rec = (
+            _encode_dns_record(host_fqdn, 1, 0x8001, ttl, ipaddress.IPv4Address(adv_ip).packed)
+            if adv_ip and adv_ip not in ("0.0.0.0", "")
+            else b""
+        )
+
+        if query_type == "announcement":
+            answers.extend(ptr_rec)
+            answers.extend(srv_rec)
+            answers.extend(txt_rec)
+            num_answers += 3
+            if a_rec and host_fqdn not in seen_hosts:
+                seen_hosts.add(host_fqdn)
+                answers.extend(a_rec)
+                num_answers += 1
+        elif query_type == "host_a":
+            if a_rec and host_fqdn not in seen_hosts:
+                seen_hosts.add(host_fqdn)
+                answers.extend(a_rec)
+                num_answers += 1
+            additionals.extend(ptr_rec)
+            additionals.extend(srv_rec)
+            additionals.extend(txt_rec)
+            num_additionals += 3
+        elif query_type == "srv":
+            answers.extend(srv_rec)
+            num_answers += 1
+            additionals.extend(ptr_rec)
+            additionals.extend(txt_rec)
+            num_additionals += 2
+            if a_rec and host_fqdn not in seen_hosts:
+                seen_hosts.add(host_fqdn)
+                additionals.extend(a_rec)
+                num_additionals += 1
+        elif query_type == "txt":
+            answers.extend(txt_rec)
+            num_answers += 1
+            additionals.extend(ptr_rec)
+            additionals.extend(srv_rec)
+            num_additionals += 2
+            if a_rec and host_fqdn not in seen_hosts:
+                seen_hosts.add(host_fqdn)
+                additionals.extend(a_rec)
+                num_additionals += 1
+        else:  # default "ptr" query
+            answers.extend(ptr_rec)
+            num_answers += 1
+            additionals.extend(srv_rec)
+            additionals.extend(txt_rec)
+            num_additionals += 2
+            if a_rec and host_fqdn not in seen_hosts:
+                seen_hosts.add(host_fqdn)
+                additionals.extend(a_rec)
+                num_additionals += 1
+
+    # Include canonical bridge host A record
+    if ip_address and ip_address not in ("0.0.0.0", ""):
+        canon_host = "podcast-bridge.local."
+        canon_a = _encode_dns_record(canon_host, 1, 0x8001, ttl, ipaddress.IPv4Address(ip_address).packed)
+        if query_type == "announcement":
+            answers.extend(canon_a)
+            num_answers += 1
+        else:
+            additionals.extend(canon_a)
+            num_additionals += 1
+
     header = struct.pack(">HHHHHH", 0, 0x8400, 0, num_answers, 0, num_additionals)
     return bytes(header + answers + additionals)
 
 
 def build_receiver_goodbye_packet(receiver: VirtualChromecastAudio, ip_address: str) -> bytes:
     """Build an RFC 6762 goodbye packet (TTL=0) for a stopping Cast receiver."""
-    return build_multi_mdns_packet([receiver], ip_address, ttl=0)
+    return build_multi_mdns_packet([receiver], ip_address, ttl=0, query_type="ptr")
 
 
 class SharedRawMdnsAdvertiser:
-    """Direct UDP multicast mDNS responder on 224.0.0.251:5353 bound to the LAN interface.
+    """Direct UDP multicast mDNS responder on 224.0.0.251:5353 and SSDP DIAL on 239.255.255.250:1900.
 
-    Serves unified multi-device RFC 6762 responses for all bridged Chromecast Audio devices,
-    preventing Linux SO_REUSEPORT kernel 4-tuple query starvation across multiple speakers.
+    Serves unified multi-device RFC 6762 responses and UPnP/SSDP M-SEARCH replies for all bridged
+    Chromecast Audio devices, preventing Linux SO_REUSEPORT kernel 4-tuple query starvation across multiple
+    speakers and ensuring both Living Room and Kitchen devices are discoverable by Android apps, Spotify, and Chrome.
     """
 
     def __init__(
         self,
         ip_address: str,
         receivers_provider: Callable[[], List[VirtualChromecastAudio]],
-        interval: float = 20.0,
+        interval: float = 10.0,
     ) -> None:
         self.ip_address = ip_address
         self.receivers_provider = receivers_provider
         self.interval = interval
         self._sock: Optional[socket.socket] = None
+        self._ssdp_sock: Optional[socket.socket] = None
         self._task: Optional[asyncio.Task[None]] = None
+        self._announce_task: Optional[asyncio.Task[None]] = None
+        self._ssdp_task: Optional[asyncio.Task[None]] = None
 
     async def start(self) -> None:
         if not self.ip_address or self.ip_address in ("0.0.0.0",):
             return
+
+        # 1. Start mDNS listener on port 5353
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -245,23 +303,56 @@ class SharedRawMdnsAdvertiser:
             sock.setblocking(False)
             self._sock = sock
             self._task = asyncio.create_task(self._run_loop())
-            logger.info("SharedRawMdnsAdvertiser started on %s:5353", self.ip_address)
+            self._announce_task = asyncio.create_task(self._periodic_announce_loop())
+            logger.info("SharedRawMdnsAdvertiser mDNS started on %s:5353", self.ip_address)
         except Exception as exc:
             logger.debug("SharedRawMdnsAdvertiser bind notice (%s): %s", self.ip_address, exc)
 
-    async def stop(self) -> None:
-        if self._task:
-            self._task.cancel()
+        # 2. Start SSDP DIAL listener on port 1900
+        try:
+            ssdp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            ssdp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    ssdp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError:
+                    pass
+            ssdp_sock.bind(("", 1900))
+            smreq = socket.inet_aton("239.255.255.250") + (
+                socket.inet_aton(self.ip_address) if self.ip_address != "127.0.0.1" else socket.inet_aton("0.0.0.0")
+            )
             try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
+                ssdp_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, smreq)
+            except OSError:
+                ssdp_sock.setsockopt(
+                    socket.IPPROTO_IP,
+                    socket.IP_ADD_MEMBERSHIP,
+                    socket.inet_aton("239.255.255.250") + socket.inet_aton("0.0.0.0"),
+                )
+            ssdp_sock.setblocking(False)
+            self._ssdp_sock = ssdp_sock
+            self._ssdp_task = asyncio.create_task(self._ssdp_loop())
+            logger.info("SharedRawMdnsAdvertiser SSDP started on %s:1900", self.ip_address)
+        except Exception as exc:
+            logger.debug("SharedRawMdnsAdvertiser SSDP bind notice: %s", exc)
+
+    async def stop(self) -> None:
+        for t in (self._task, self._announce_task, self._ssdp_task):
+            if t:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+        self._task = None
+        self._announce_task = None
+        self._ssdp_task = None
+
         if self._sock:
             try:
                 receivers = [r for r in self.receivers_provider() if getattr(r.device, "enabled", True)]
                 if receivers:
-                    goodbye = build_multi_mdns_packet(receivers, self.ip_address, ttl=0)
+                    goodbye = build_multi_mdns_packet(receivers, self.ip_address, ttl=0, query_type="ptr")
                     self._sock.sendto(goodbye, (MDNS_MULTICAST_ADDR, MDNS_PORT))
             except Exception:
                 pass
@@ -271,6 +362,13 @@ class SharedRawMdnsAdvertiser:
                 pass
             self._sock = None
 
+        if self._ssdp_sock:
+            try:
+                self._ssdp_sock.close()
+            except Exception:
+                pass
+            self._ssdp_sock = None
+
     async def announce_all(self) -> None:
         """Broadcast all active devices to 224.0.0.251:5353."""
         if not self._sock:
@@ -278,10 +376,13 @@ class SharedRawMdnsAdvertiser:
         receivers = [r for r in self.receivers_provider() if getattr(r.device, "enabled", True)]
         if not receivers:
             return
-        pkt = build_multi_mdns_packet(receivers, self.ip_address)
+        # Broadcast full unsolicited announcement per RFC 6762 8.3
+        pkt_ann = build_multi_mdns_packet(receivers, self.ip_address, query_type="announcement")
+        pkt_ptr = build_multi_mdns_packet(receivers, self.ip_address, query_type="ptr")
         loop = asyncio.get_running_loop()
         try:
-            await loop.sock_sendto(self._sock, pkt, (MDNS_MULTICAST_ADDR, MDNS_PORT))
+            await loop.sock_sendto(self._sock, pkt_ann, (MDNS_MULTICAST_ADDR, MDNS_PORT))
+            await loop.sock_sendto(self._sock, pkt_ptr, (MDNS_MULTICAST_ADDR, MDNS_PORT))
         except Exception as exc:
             logger.debug("SharedRawMdnsAdvertiser announce_all notice: %s", exc)
 
@@ -296,49 +397,151 @@ class SharedRawMdnsAdvertiser:
         except Exception as exc:
             logger.debug("SharedRawMdnsAdvertiser announce_goodbye notice: %s", exc)
 
+    async def _periodic_announce_loop(self) -> None:
+        """Periodic gratuitous mDNS announcements to ensure mobile devices pick up all speakers immediately."""
+        bursts = 0
+        while True:
+            try:
+                await self.announce_all()
+                bursts += 1
+                delay = 1.0 if bursts < 3 else (5.0 if bursts < 8 else self.interval)
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("Periodic announcement notice: %s", exc)
+                await asyncio.sleep(5.0)
+
+    async def _ssdp_loop(self) -> None:
+        """SSDP responder for DIAL / Spotify Connect / YouTube M-SEARCH on 239.255.255.250:1900."""
+        loop = asyncio.get_running_loop()
+        if not self._ssdp_sock:
+            return
+
+        while True:
+            try:
+                data, addr = await loop.sock_recvfrom(self._ssdp_sock, 4096)
+                text = data.decode("utf-8", errors="replace")
+                if "M-SEARCH" not in text:
+                    continue
+
+                is_dial = (
+                    "urn:dial-multiscreen-org:service:dial:1" in text
+                    or "ssdp:all" in text
+                    or "upnp:rootdevice" in text
+                )
+                if not is_dial:
+                    continue
+
+                receivers = [r for r in self.receivers_provider() if getattr(r.device, "enabled", True)]
+                for r in receivers:
+                    adv_ip = r.host_ip if (r.host_ip and r.host_ip not in ("0.0.0.0", "")) else self.ip_address
+                    e_port = r.device.eureka_port
+                    u_uuid = r.hyphenated_uuid
+                    resp = (
+                        "HTTP/1.1 200 OK\r\n"
+                        "CACHE-CONTROL: max-age=1800\r\n"
+                        "EXT:\r\n"
+                        f"LOCATION: http://{adv_ip}:{e_port}/ssdp/device-desc.xml\r\n"
+                        "SERVER: Linux/4.19 UPnP/1.0 PodCastBridge/0.4.7\r\n"
+                        "ST: urn:dial-multiscreen-org:service:dial:1\r\n"
+                        f"USN: uuid:{u_uuid}::urn:dial-multiscreen-org:service:dial:1\r\n"
+                        "BOOTID.UPNP.ORG: 1\r\n"
+                        "CONFIGID.UPNP.ORG: 1\r\n"
+                        "\r\n"
+                    ).encode("utf-8")
+                    try:
+                        await loop.sock_sendto(self._ssdp_sock, resp, addr)
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("SSDP loop notice: %s", exc)
+                await asyncio.sleep(2.0)
+
     async def _run_loop(self) -> None:
         loop = asyncio.get_running_loop()
         assert self._sock is not None
         service_wire = _encode_dns_name(GOOGLECAST_SERVICE)[:-1]
 
-        # Initial burst: 2 announcements 1s apart per RFC 6762
-        for _ in range(2):
-            await asyncio.sleep(1.0)
-            await self.announce_all()
-
         while True:
             try:
-                data, addr = await asyncio.wait_for(loop.sock_recvfrom(self._sock, 9000), timeout=self.interval)
-                if len(data) >= 12:
-                    flags = struct.unpack(">H", data[2:4])[0]
-                    is_query = (flags & 0x8000) == 0
-                    if is_query:
-                        receivers = [r for r in self.receivers_provider() if getattr(r.device, "enabled", True)]
-                        if not receivers:
-                            continue
-                        matches = service_wire in data
-                        if not matches:
-                            for r in receivers:
-                                inst_wire = _encode_dns_name(f"Chromecast-Audio-{r.clean_id}")[:-1]
-                                if inst_wire in data:
-                                    matches = True
-                                    break
-                        if matches:
-                            pkt = build_multi_mdns_packet(receivers, self.ip_address)
-                            # Multicast to 224.0.0.251:5353
-                            await loop.sock_sendto(self._sock, pkt, (MDNS_MULTICAST_ADDR, MDNS_PORT))
-                            # Direct unicast reply to querier
-                            if addr and addr[0] not in ("0.0.0.0", "127.0.0.1"):
-                                try:
-                                    await loop.sock_sendto(self._sock, pkt, addr)
-                                except Exception:
-                                    pass
-            except asyncio.TimeoutError:
-                await self.announce_all()
+                data, addr = await loop.sock_recvfrom(self._sock, 9000)
+                if len(data) < 12:
+                    continue
+                flags = struct.unpack(">H", data[2:4])[0]
+                is_query = (flags & 0x8000) == 0
+                if not is_query:
+                    continue
+
+                receivers = [r for r in self.receivers_provider() if getattr(r.device, "enabled", True)]
+                if not receivers:
+                    continue
+
+                query_type = "ptr"
+                matches = False
+
+                # Parse query using zeroconf.DNSIncoming for exact question matching
+                try:
+                    incoming = zeroconf.DNSIncoming(data)
+                    for q in incoming.questions:
+                        qname = q.name.lower().rstrip(".")
+                        if qname == GOOGLECAST_SERVICE.lower():
+                            matches = True
+                            query_type = "ptr"
+                            break
+                        if any(r.clean_id.lower() in qname for r in receivers):
+                            matches = True
+                            query_type = "srv" if q.type == 33 else ("txt" if q.type == 16 else "ptr")
+                            break
+                        if any(r.hyphenated_uuid.lower() in qname for r in receivers) or "podcast-bridge" in qname:
+                            matches = True
+                            query_type = "host_a"
+                            break
+                except Exception:
+                    pass
+
+                # Wire byte fallback if zeroconf parsing did not match
+                if not matches:
+                    if service_wire in data or b"_googlecast" in data:
+                        matches = True
+                        query_type = "ptr"
+                    elif any(r.clean_id.encode("ascii") in data for r in receivers):
+                        matches = True
+                        query_type = "ptr"
+                    elif any(r.hyphenated_uuid.encode("ascii") in data for r in receivers):
+                        matches = True
+                        query_type = "host_a"
+                    elif b"podcast-bridge" in data:
+                        matches = True
+                        query_type = "host_a"
+                    else:
+                        for r in receivers:
+                            inst_wire = _encode_dns_name(f"Chromecast-Audio-{r.clean_id}")[:-1]
+                            if inst_wire in data:
+                                matches = True
+                                query_type = "ptr"
+                                break
+
+                if matches:
+                    pkt = build_multi_mdns_packet(receivers, self.ip_address, query_type=query_type)
+                    # Multicast to 224.0.0.251:5353
+                    try:
+                        await loop.sock_sendto(self._sock, pkt, (MDNS_MULTICAST_ADDR, MDNS_PORT))
+                    except Exception:
+                        pass
+                    # Direct unicast reply to querier
+                    if addr and addr[0] not in ("0.0.0.0", "127.0.0.1"):
+                        try:
+                            await loop.sock_sendto(self._sock, pkt, addr)
+                        except Exception:
+                            pass
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                await asyncio.sleep(2.0)
+            except Exception as exc:
+                logger.debug("SharedRawMdnsAdvertiser query notice: %s", exc)
+                await asyncio.sleep(0.5)
 
 
 class RawMdnsAdvertiser:
@@ -496,10 +699,12 @@ class VirtualChromecastAudio:
         on_event: Optional[Callable[[str, str, str, str, str, str], None]] = None,
         on_state_change: Optional[Callable[[HomePodDevice], None]] = None,
         mdns_enabled: bool = True,
+        receivers_provider: Optional[Callable[[], List[VirtualChromecastAudio]]] = None,
     ) -> None:
         self.device = device
         self.host_ip = host_ip
         self.auth_manager = auth_manager
+        self.receivers_provider = receivers_provider
         self._on_load_media = on_load_media
         self._on_pause = on_pause
         self._on_resume = on_resume
@@ -1700,6 +1905,7 @@ class VirtualChromecastAudio:
 
             # Read headers
             content_length = 0
+            host_header = ""
             while True:
                 line = await asyncio.wait_for(reader.readline(), timeout=5.0)
                 if not line or line in (b"\r\n", b"\n"):
@@ -1707,6 +1913,8 @@ class VirtualChromecastAudio:
                 hdr = line.decode("utf-8", errors="replace").strip()
                 if hdr.lower().startswith("content-length:"):
                     content_length = int(hdr.split(":", 1)[1].strip())
+                elif hdr.lower().startswith("host:"):
+                    host_header = hdr.split(":", 1)[1].strip()
 
             body = b""
             if content_length > 0:
@@ -1714,7 +1922,24 @@ class VirtualChromecastAudio:
 
             if path.startswith("/setup/eureka_info"):
                 params_arg = query_dict.get("params", [None])[0]
-                info = self._build_eureka_info(params_query=params_arg)
+                target_receiver = self
+                if self.receivers_provider:
+                    all_recvs = self.receivers_provider()
+                    req_id = query_dict.get("id", [None])[0] or query_dict.get("device_id", [None])[0]
+                    if req_id:
+                        for r in all_recvs:
+                            if req_id.lower() in (r.clean_id.lower(), r.hyphenated_uuid.lower()):
+                                target_receiver = r
+                                break
+                    elif host_header:
+                        for r in all_recvs:
+                            if r.hyphenated_uuid.lower() in host_header.lower() or r.clean_id.lower() in host_header.lower():
+                                target_receiver = r
+                                break
+                            if "kitchen" in host_header.lower() and "kitchen" in r.device.name.lower():
+                                target_receiver = r
+                                break
+                info = target_receiver._build_eureka_info(params_query=params_arg)
                 await self._send_http(writer, 200, "application/json", json.dumps(info).encode("utf-8"))
 
             elif path == "/setup/icon.png":
